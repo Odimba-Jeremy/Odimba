@@ -1,5 +1,5 @@
-Flask
-Flask
-PyJWT
-bcrypt
-gunicorn
+Flask==2.3.3
+Flask-CORS==3.0.10
+PyJWT==2.9.0
+bcrypt==4.0.1
+gunicorn==21.2.0
