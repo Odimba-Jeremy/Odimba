@@ -836,7 +836,7 @@ def get_laboratory_test(test_id: int):
     return jsonify(enrich_lab_test(test))
 
 @app.route("/api/laboratory/tests/<int:test_id>/result", methods=["PUT"])
-@roles_required("super_admin", "laboratoire")
+@roles_required("super_admin", "laboratoire","docteur")
 def save_laboratory_result(test_id: int):
     test = get_one(LAB_TESTS_TABLE, test_id)
     if not test:
