@@ -317,31 +317,64 @@ def enrich_invoice(invoice: dict[str, Any], patient_map: dict[int, dict[str, Any
         item["line_items"] = build_line_items(item.get("description", ""), to_float(item.get("amount", 0)), None)
     return item
 
-# ==================== SEED SUPER ADMIN ====================
+# ==================== SEED SUPER ADMIN (VERSION CORRIGÉE) ====================
 def seed_default_admin() -> None:
+    """Crée le super admin au démarrage si inexistant (avec logs visibles)"""
     try:
-        admins = query_table(USERS_TABLE, filters={"role": "super_admin"}, limit=1)
-        if admins:
+        print("🔍 Vérification du super admin...")
+        
+        # Vérifier si un super admin existe déjà
+        response = supabase.table(USERS_TABLE).select("*").eq("role", "super_admin").limit(1).execute()
+        existing_admin = response.data[0] if response.data else None
+        
+        if existing_admin:
+            print(f"✅ Super admin déjà présent: {existing_admin.get('email')}")
             return
         
-        if not SUPER_ADMIN_EMAIL or not SUPER_ADMIN_PASSWORD:
-            return
-
-        admin = insert_row(
-            USERS_TABLE,
-            {
-                "name": SUPER_ADMIN_NAME,
-                "email": SUPER_ADMIN_EMAIL,
-                "password_hash": generate_password_hash(SUPER_ADMIN_PASSWORD),
-                "role": "super_admin",
-                "is_active": True,
-                "created_at": now_iso(),
-                "updated_at": now_iso(),
-            },
-        )
-        add_audit("SEED", "user", admin, "Compte super administrateur cree automatiquement", admin["id"])
-    except Exception:
-        pass
+        print("📝 Création du super admin...")
+        
+        # Créer le super admin
+        admin_data = {
+            "name": SUPER_ADMIN_NAME,
+            "email": SUPER_ADMIN_EMAIL,
+            "password_hash": generate_password_hash(SUPER_ADMIN_PASSWORD),
+            "role": "super_admin",
+            "is_active": True,
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+        
+        insert_response = supabase.table(USERS_TABLE).insert(admin_data).execute()
+        
+        if insert_response.data and len(insert_response.data) > 0:
+            new_admin = insert_response.data[0]
+            print(f"✅ Super admin créé avec succès!")
+            print(f"   Email: {SUPER_ADMIN_EMAIL}")
+            print(f"   Nom: {SUPER_ADMIN_NAME}")
+            print(f"   ID: {new_admin.get('id')}")
+            
+            # Ajouter un audit log
+            try:
+                supabase.table(AUDIT_TABLE).insert({
+                    "action": "SEED",
+                    "entity_type": "user",
+                    "entity_id": new_admin.get('id'),
+                    "user_id": new_admin.get('id'),
+                    "user_name": SUPER_ADMIN_NAME,
+                    "details": "Compte super administrateur créé automatiquement au démarrage",
+                    "created_at": now_iso(),
+                }).execute()
+                print("📝 Audit log ajouté")
+            except Exception as audit_error:
+                print(f"⚠️ Erreur audit log (non bloquante): {audit_error}")
+        else:
+            print("❌ Échec: Aucune donnée retournée après insertion")
+            
+    except Exception as e:
+        print(f"❌ ERREUR CRITIQUE lors de la création du super admin: {e}")
+        print(f"   Type: {type(e).__name__}")
+        print(f"   Détails: {str(e)}")
+        # Ne pas masquer l'erreur pour le debugging
 
 # ==================== ROUTES API ====================
 @app.route("/api/health", methods=["GET"])
@@ -408,6 +441,46 @@ def login():
 @token_required
 def auth_me():
     return jsonify({"user": public_user(request.current_user)})
+
+# Route de secours pour créer l'admin manuellement (optionnel)
+@app.route("/api/admin/setup", methods=["POST"])
+def setup_admin():
+    """Route de secours pour créer le super admin (à désactiver après utilisation)"""
+    try:
+        # Vérifier si admin existe
+        existing = supabase.table(USERS_TABLE).select("*").eq("email", SUPER_ADMIN_EMAIL).limit(1).execute()
+        
+        if existing.data and len(existing.data) > 0:
+            return jsonify({
+                "message": "Super admin existe déjà",
+                "email": SUPER_ADMIN_EMAIL,
+                "role": existing.data[0].get("role")
+            }), 200
+        
+        # Créer l'admin
+        admin_data = {
+            "name": SUPER_ADMIN_NAME,
+            "email": SUPER_ADMIN_EMAIL,
+            "password_hash": generate_password_hash(SUPER_ADMIN_PASSWORD),
+            "role": "super_admin",
+            "is_active": True,
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+        
+        result = supabase.table(USERS_TABLE).insert(admin_data).execute()
+        
+        if result.data and len(result.data) > 0:
+            return jsonify({
+                "message": "Super admin créé avec succès",
+                "email": SUPER_ADMIN_EMAIL,
+                "warning": "Changez ce mot de passe immédiatement!"
+            }), 201
+        else:
+            return jsonify({"error": "Échec de création"}), 500
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/patients", methods=["GET"])
 @roles_required(*PATIENT_READ_ROLES)
@@ -872,8 +945,11 @@ def get_audit_logs():
 
 # ==================== POINT D'ENTRÉE ====================
 if __name__ == "__main__":
-    seed_default_admin()
+    print("=" * 50)
     print("USHUDa Hospital API - Supabase")
-    print(f"API: http://{HOST}:{PORT}/api")
-    print("Base de donnees: Supabase")
+    print("=" * 50)
+    seed_default_admin()  # Version corrigée avec logs
+    print(f"🌐 API: http://{HOST}:{PORT}/api")
+    print(f"🗄️ Base de donnees: Supabase")
+    print("=" * 50)
     app.run(host=HOST, port=PORT, debug=DEBUG)
