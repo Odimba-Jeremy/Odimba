@@ -30,12 +30,14 @@ SUPER_ADMIN_NAME = "Administrateur"
 SUPER_ADMIN_EMAIL = "jeremyodimba322@gmail.com"
 SUPER_ADMIN_PASSWORD = "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"
 
+SESSION_COOKIE_NAME = "ushuda_session"
+SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "false").strip().lower() == "true"
+SESSION_COOKIE_SAMESITE = os.getenv("SESSION_COOKIE_SAMESITE", "Lax").strip() or "Lax"
+
 # ==================== INITIALISATION ====================
 app = Flask(__name__)
 app.config["SECRET_KEY"] = APP_SECRET
-
-# CORS corrigé pour Android - accepte TOUTES les origines
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 token_serializer = URLSafeTimedSerializer(APP_SECRET, salt="ushuda-auth-token")
@@ -104,8 +106,21 @@ def to_float(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
+def to_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
 def public_user(user: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in user.items() if key != "password_hash"}
+    return {key: value for key, value in user.items() if key not in {"password_hash", "password"}}
+
+def serialize_user_row(user: dict[str, Any]) -> dict[str, Any]:
+    item = dict(user)
+    item.pop("password_hash", None)
+    item.pop("password", None)
+    return item
 
 def build_line_items(description: str, amount: float, items: Any) -> list[dict[str, Any]]:
     if isinstance(items, list) and items:
@@ -212,6 +227,25 @@ def create_token(user: dict[str, Any]) -> str:
 def decode_token(token: str) -> dict[str, Any]:
     return token_serializer.loads(token, max_age=TOKEN_TTL_SECONDS)
 
+def auth_cookie_params(remember_me: bool = False) -> dict[str, Any]:
+    params = {
+        "httponly": True,
+        "secure": SESSION_COOKIE_SECURE,
+        "samesite": SESSION_COOKIE_SAMESITE,
+        "path": "/",
+    }
+    if remember_me:
+        params["max_age"] = TOKEN_TTL_SECONDS
+    return params
+
+def set_auth_cookie(response, token: str, remember_me: bool = False):
+    response.set_cookie(SESSION_COOKIE_NAME, token, **auth_cookie_params(remember_me))
+    return response
+
+def clear_auth_cookie(response):
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    return response
+
 def add_audit(action: str, entity_type: str, user: dict[str, Any] | None = None, details: str | None = None, entity_id: int | None = None) -> None:
     actor = user or {}
     payload = {
@@ -230,12 +264,13 @@ def token_required(handler):
     @wraps(handler)
     def wrapped(*args, **kwargs):
         auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return error("Session expiree. Veuillez vous reconnecter.", 401)
-
-        token = auth_header[7:].strip()
+        token = ""
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
         if not token:
-            return error("Token manquant.", 401)
+            token = str(request.cookies.get(SESSION_COOKIE_NAME, "")).strip()
+        if not token:
+            return error("Session expiree. Veuillez vous reconnecter.", 401)
 
         try:
             payload = decode_token(token)
@@ -317,23 +352,16 @@ def enrich_invoice(invoice: dict[str, Any], patient_map: dict[int, dict[str, Any
         item["line_items"] = build_line_items(item.get("description", ""), to_float(item.get("amount", 0)), None)
     return item
 
-# ==================== SEED SUPER ADMIN (VERSION CORRIGÉE) ====================
+# ==================== SEED SUPER ADMIN ====================
 def seed_default_admin() -> None:
-    """Crée le super admin au démarrage si inexistant (avec logs visibles)"""
     try:
-        print("🔍 Vérification du super admin...")
-        
-        # Vérifier si un super admin existe déjà
         response = supabase.table(USERS_TABLE).select("*").eq("role", "super_admin").limit(1).execute()
         existing_admin = response.data[0] if response.data else None
-        
+
         if existing_admin:
-            print(f"✅ Super admin déjà présent: {existing_admin.get('email')}")
+            print(f"Super admin deja present: {existing_admin.get('email')}")
             return
-        
-        print("📝 Création du super admin...")
-        
-        # Créer le super admin
+
         admin_data = {
             "name": SUPER_ADMIN_NAME,
             "email": SUPER_ADMIN_EMAIL,
@@ -343,40 +371,28 @@ def seed_default_admin() -> None:
             "created_at": now_iso(),
             "updated_at": now_iso(),
         }
-        
+
         insert_response = supabase.table(USERS_TABLE).insert(admin_data).execute()
-        
         if insert_response.data and len(insert_response.data) > 0:
             new_admin = insert_response.data[0]
-            print(f"✅ Super admin créé avec succès!")
-            print(f"   Email: {SUPER_ADMIN_EMAIL}")
-            print(f"   Nom: {SUPER_ADMIN_NAME}")
-            print(f"   ID: {new_admin.get('id')}")
-            
-            # Ajouter un audit log
             try:
-                supabase.table(AUDIT_TABLE).insert({
-                    "action": "SEED",
-                    "entity_type": "user",
-                    "entity_id": new_admin.get('id'),
-                    "user_id": new_admin.get('id'),
-                    "user_name": SUPER_ADMIN_NAME,
-                    "details": "Compte super administrateur créé automatiquement au démarrage",
-                    "created_at": now_iso(),
-                }).execute()
-                print("📝 Audit log ajouté")
-            except Exception as audit_error:
-                print(f"⚠️ Erreur audit log (non bloquante): {audit_error}")
-        else:
-            print("❌ Échec: Aucune donnée retournée après insertion")
-            
+                supabase.table(AUDIT_TABLE).insert(
+                    {
+                        "action": "SEED",
+                        "entity_type": "user",
+                        "entity_id": new_admin.get("id"),
+                        "user_id": new_admin.get("id"),
+                        "user_name": SUPER_ADMIN_NAME,
+                        "details": "Compte super administrateur cree automatiquement au demarrage",
+                        "created_at": now_iso(),
+                    }
+                ).execute()
+            except Exception:
+                pass
     except Exception as e:
-        print(f"❌ ERREUR CRITIQUE lors de la création du super admin: {e}")
-        print(f"   Type: {type(e).__name__}")
-        print(f"   Détails: {str(e)}")
-        # Ne pas masquer l'erreur pour le debugging
+        print(f"Erreur seed super admin: {e}")
 
-# ==================== ROUTES API ====================
+# ==================== ROUTES AUTH ====================
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify(
@@ -395,6 +411,7 @@ def register():
     email = str(data.get("email", "")).strip().lower()
     password = str(data.get("password", ""))
     role = str(data.get("role", "reception")).strip().lower()
+    remember_me = to_bool(data.get("remember_me", False))
 
     if len(name) < 2:
         return error("Le nom doit contenir au moins 2 caracteres.", 422)
@@ -420,13 +437,16 @@ def register():
         },
     )
     add_audit("CREATE", "user", user, f"Inscription: {email} ({role})", user["id"])
-    return jsonify({"user": public_user(user), "token": create_token(user)}), 201
+    token = create_token(user)
+    response = jsonify({"user": public_user(user), "token": token})
+    return set_auth_cookie(response, token, remember_me), 201
 
 @app.route("/api/auth/login", methods=["POST"])
 def login():
     data = safe_json()
     email = str(data.get("email", "")).strip().lower()
     password = str(data.get("password", ""))
+    remember_me = to_bool(data.get("remember_me", False))
 
     user = get_user_by_email(email)
     if not user or not check_password_hash(user.get("password_hash", ""), password):
@@ -435,53 +455,120 @@ def login():
         return error("Compte desactive.", 403)
 
     add_audit("LOGIN", "user", user, f"Connexion: {email}", user["id"])
-    return jsonify({"user": public_user(user), "token": create_token(user)})
+    token = create_token(user)
+    response = jsonify({"user": public_user(user), "token": token})
+    return set_auth_cookie(response, token, remember_me)
 
 @app.route("/api/auth/me", methods=["GET"])
 @token_required
 def auth_me():
     return jsonify({"user": public_user(request.current_user)})
 
-# Route de secours pour créer l'admin manuellement (optionnel)
-@app.route("/api/admin/setup", methods=["POST"])
-def setup_admin():
-    """Route de secours pour créer le super admin (à désactiver après utilisation)"""
-    try:
-        # Vérifier si admin existe
-        existing = supabase.table(USERS_TABLE).select("*").eq("email", SUPER_ADMIN_EMAIL).limit(1).execute()
-        
-        if existing.data and len(existing.data) > 0:
-            return jsonify({
-                "message": "Super admin existe déjà",
-                "email": SUPER_ADMIN_EMAIL,
-                "role": existing.data[0].get("role")
-            }), 200
-        
-        # Créer l'admin
-        admin_data = {
-            "name": SUPER_ADMIN_NAME,
-            "email": SUPER_ADMIN_EMAIL,
-            "password_hash": generate_password_hash(SUPER_ADMIN_PASSWORD),
-            "role": "super_admin",
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    response = jsonify({"message": "Deconnexion reussie."})
+    return clear_auth_cookie(response)
+
+# ==================== GESTION COMPTES ADMIN ====================
+@app.route("/api/users", methods=["GET"])
+@app.route("/api/auth/users", methods=["GET"])
+@roles_required("super_admin")
+def list_users():
+    users = query_table(USERS_TABLE, order="created_at", desc=True)
+    return jsonify([serialize_user_row(user) for user in users])
+
+@app.route("/api/users", methods=["POST"])
+@app.route("/api/auth/users", methods=["POST"])
+@roles_required("super_admin")
+def create_user():
+    data = safe_json()
+    name = str(data.get("name", "")).strip()
+    email = str(data.get("email", "")).strip().lower()
+    password = str(data.get("password", ""))
+    role = str(data.get("role", "reception")).strip().lower()
+
+    if len(name) < 2:
+        return error("Le nom doit contenir au moins 2 caracteres.", 422)
+    if "@" not in email:
+        return error("Email invalide.", 422)
+    if len(password) < 8:
+        return error("Le mot de passe doit contenir au moins 8 caracteres.", 422)
+    if role not in STAFF_ROLES:
+        return error("Role invalide.", 422)
+    if get_user_by_email(email):
+        return error("Cet email est deja utilise.", 422)
+
+    user = insert_row(
+        USERS_TABLE,
+        {
+            "name": name,
+            "email": email,
+            "password_hash": generate_password_hash(password),
+            "role": role,
             "is_active": True,
             "created_at": now_iso(),
             "updated_at": now_iso(),
-        }
-        
-        result = supabase.table(USERS_TABLE).insert(admin_data).execute()
-        
-        if result.data and len(result.data) > 0:
-            return jsonify({
-                "message": "Super admin créé avec succès",
-                "email": SUPER_ADMIN_EMAIL,
-                "warning": "Changez ce mot de passe immédiatement!"
-            }), 201
-        else:
-            return jsonify({"error": "Échec de création"}), 500
-            
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        },
+    )
+    add_audit("CREATE", "user", request.current_user, f"Compte cree: {email} ({role})", user["id"])
+    return jsonify({"user": serialize_user_row(user)}), 201
 
+@app.route("/api/users/<int:user_id>", methods=["PUT"])
+@app.route("/api/auth/users/<int:user_id>", methods=["PUT"])
+@roles_required("super_admin")
+def update_user(user_id: int):
+    user = get_user_by_id(user_id)
+    if not user:
+        return error("Utilisateur introuvable.", 404)
+
+    data = safe_json()
+    payload: dict[str, Any] = {}
+
+    if "name" in data:
+        payload["name"] = str(data.get("name", "")).strip()
+    if "email" in data:
+        payload["email"] = str(data.get("email", "")).strip().lower()
+    if "role" in data:
+        role = str(data.get("role", "")).strip().lower()
+        if role not in STAFF_ROLES:
+            return error("Role invalide.", 422)
+        payload["role"] = role
+    if "is_active" in data:
+        payload["is_active"] = to_bool(data.get("is_active"))
+
+    if "password" in data and str(data.get("password", "")).strip():
+        password = str(data.get("password", "")).strip()
+        if len(password) < 8:
+            return error("Le mot de passe doit contenir au moins 8 caracteres.", 422)
+        payload["password_hash"] = generate_password_hash(password)
+
+    if payload.get("email") and payload["email"] != user.get("email"):
+        if get_user_by_email(payload["email"]):
+            return error("Cet email est deja utilise.", 422)
+
+    updated = update_row(USERS_TABLE, user_id, payload)
+    add_audit("UPDATE", "user", request.current_user, f"Compte modifie: {updated['email']}", user_id)
+    return jsonify({"user": serialize_user_row(updated)})
+
+@app.route("/api/users/<int:user_id>", methods=["DELETE"])
+@app.route("/api/auth/users/<int:user_id>", methods=["DELETE"])
+@roles_required("super_admin")
+def delete_user(user_id: int):
+    user = get_user_by_id(user_id)
+    if not user:
+        return error("Utilisateur introuvable.", 404)
+    if to_int(request.current_user.get("id")) == user_id:
+        return error("Vous ne pouvez pas supprimer votre propre compte.", 422)
+    if user.get("role") == "super_admin":
+        admins = [item for item in query_table(USERS_TABLE, filters={"role": "super_admin"}) if to_int(item.get("id")) != user_id]
+        if not admins:
+            return error("Impossible de supprimer le dernier super administrateur.", 422)
+
+    delete_row(USERS_TABLE, user_id)
+    add_audit("DELETE", "user", request.current_user, f"Compte supprime: {user['email']}", user_id)
+    return jsonify({"message": "Compte supprime."})
+
+# ==================== PATIENTS ====================
 @app.route("/api/patients", methods=["GET"])
 @roles_required(*PATIENT_READ_ROLES)
 def get_patients():
@@ -600,6 +687,7 @@ def get_patient_lab_results(patient_id: int):
     completed = [item for item in tests if item.get("status") == "completed"]
     return jsonify([enrich_lab_test(item, patient_map) for item in completed])
 
+# ==================== APPOINTMENTS ====================
 @app.route("/api/appointments", methods=["GET"])
 @roles_required(*STAFF_ROLES)
 def get_appointments():
@@ -656,6 +744,7 @@ def update_appointment_status(appointment_id: int):
     add_audit("UPDATE", "appointment", request.current_user, f"RDV #{appointment_id} -> {status}", appointment_id)
     return jsonify(enrich_appointment(updated))
 
+# ==================== PRESCRIPTIONS ====================
 @app.route("/api/prescriptions", methods=["GET"])
 @roles_required(*STAFF_ROLES)
 def get_prescriptions():
@@ -695,6 +784,7 @@ def create_prescription():
     add_audit("CREATE", "prescription", request.current_user, f"Prescription: {medication} pour {patient['full_name']}", prescription["id"])
     return jsonify(enrich_prescription(prescription, {patient["id"]: patient})), 201
 
+# ==================== LABORATORY ====================
 @app.route("/api/laboratory/tests", methods=["GET"])
 @roles_required(*STAFF_ROLES)
 def get_laboratory_tests():
@@ -780,6 +870,7 @@ def get_laboratory_results():
     completed = [item for item in tests if item.get("status") == "completed"]
     return jsonify([enrich_lab_test(item, patient_map) for item in completed])
 
+# ==================== CARE ====================
 @app.route("/api/care", methods=["GET"])
 @roles_required(*STAFF_ROLES)
 def get_care_logs():
@@ -816,6 +907,7 @@ def create_care_log():
     add_audit("CREATE", "care", request.current_user, f"Soin: {care_type} pour {patient['full_name']}", care_log["id"])
     return jsonify(enrich_care_log(care_log, {patient["id"]: patient})), 201
 
+# ==================== PHARMACY ====================
 @app.route("/api/pharmacy", methods=["GET"])
 @roles_required(*STAFF_ROLES)
 def get_pharmacy_items():
@@ -875,6 +967,7 @@ def update_stock(medication_id: int):
     add_audit("UPDATE", "pharmacy", request.current_user, f"Stock modifie: {item['medication_name']} -> {new_quantity}", medication_id)
     return jsonify(updated)
 
+# ==================== BILLING ====================
 @app.route("/api/billing", methods=["GET"])
 @roles_required(*STAFF_ROLES)
 def get_invoices():
@@ -937,6 +1030,7 @@ def mark_invoice_paid(invoice_id: int):
     add_audit("UPDATE", "invoice", request.current_user, f"Facture {updated['invoice_number']} payee", invoice_id)
     return jsonify(enrich_invoice(updated))
 
+# ==================== AUDIT ====================
 @app.route("/api/audit", methods=["GET"])
 @roles_required(*AUDIT_ROLES)
 def get_audit_logs():
@@ -948,8 +1042,8 @@ if __name__ == "__main__":
     print("=" * 50)
     print("USHUDa Hospital API - Supabase")
     print("=" * 50)
-    seed_default_admin()  # Version corrigée avec logs
-    print(f"🌐 API: http://{HOST}:{PORT}/api")
-    print(f"🗄️ Base de donnees: Supabase")
+    seed_default_admin()
+    print(f"API: http://{HOST}:{PORT}/api")
+    print("Base de donnees: Supabase")
     print("=" * 50)
     app.run(host=HOST, port=PORT, debug=DEBUG)
