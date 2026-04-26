@@ -1,19 +1,12 @@
-#!/usr/bin/env python3
-"""
-I HUB HOSPITAL API - BACKEND COMPLET
-Optimisé pour rapidité extrême avec mise en cache, connexion pool, et requêtes optimisées
-"""
-
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache, wraps
-from typing import Any, Dict, List, Optional
+from functools import wraps
+from typing import Any
 
 from flask import Flask, jsonify, request, g
 from flask_cors import CORS
@@ -22,7 +15,7 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from supabase import create_client, Client
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# ==================== CONFIGURATION RAPIDE ====================
+# ==================== CONFIGURATION ====================
 SUPABASE_URL = "https://figmeixteescztmmprmi.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpZ21laXh0ZWVzY3p0bW1wcm1pIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTM4NjA2MCwiZXhwIjoyMDkwOTYyMDYwfQ.zMIDYvm-Bwv0EUQzME3nZR8ZPoSwTMCaybHRnw_-7Ew"
 SECRET_KEY = "ihub_super_secret_key_2024"
@@ -30,22 +23,21 @@ HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 10000))
 DEBUG = False
 TOKEN_EXPIRY = 86400 * 7  # 7 jours
+CACHE_TIMEOUT = 300  # 5 minutes
 
 # ==================== INITIALISATION ====================
 app = Flask(__name__)
 app.config["SECRET_KEY"] = SECRET_KEY
 app.config["CACHE_TYPE"] = "SimpleCache"
-app.config["CACHE_DEFAULT_TIMEOUT"] = 300
+app.config["CACHE_DEFAULT_TIMEOUT"] = CACHE_TIMEOUT
 
-# Cache pour performances extrêmes
 cache = Cache(app)
 CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 
-# Connexion Supabase avec pool
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 
-# Constantes tables
+# Tables
 TABLES = {
     "users": "app_users",
     "patients": "patients",
@@ -58,14 +50,12 @@ TABLES = {
     "audit": "audit_logs"
 }
 
-# Rôles autorisés
 ROLES = {
     "public": ["docteur", "infirmier", "laboratoire", "pharmacie", "reception"],
     "staff": ["super_admin", "docteur", "infirmier", "laboratoire", "pharmacie", "reception"],
-    "admin_only": ["super_admin"]
 }
 
-# ==================== UTILITAIRES PERFORMANTS ====================
+# ==================== UTILITAIRES ====================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -87,15 +77,23 @@ def to_float(val: Any, default: float = 0.0) -> float:
 def normalize_status(status: str, valid: list, default: str) -> str:
     return status if status in valid else default
 
-# ==================== CACHE DÉCORATEUR ====================
-def cached(timeout=300):
+def invalidate_cache(pattern: str = None):
+    """Invalide tout le cache"""
+    cache.clear()
+
+
+# ==================== CACHE INTELLIGENT ====================
+def cached(timeout=CACHE_TIMEOUT, key_prefix=None):
+    """Décorateur de cache avec invalidation automatique sur modification"""
     def decorator(f):
         @wraps(f)
         def decorated(*args, **kwargs):
-            cache_key = f"{f.__name__}:{request.full_path}"
+            # Construire la clé de cache
+            cache_key = key_prefix or f"{f.__name__}:{request.full_path}"
             cached_data = cache.get(cache_key)
             if cached_data is not None:
                 return jsonify(cached_data)
+            
             result = f(*args, **kwargs)
             if result and hasattr(result, 'get_json'):
                 data = result.get_json()
@@ -105,12 +103,15 @@ def cached(timeout=300):
         return decorated
     return decorator
 
-def invalidate_cache(pattern: str = None):
-    cache.clear()
 
 # ==================== AUTHENTIFICATION ====================
 def create_token(user: dict) -> str:
-    payload = {"id": user["id"], "role": user["role"], "email": user["email"], "exp": int(time.time()) + TOKEN_EXPIRY}
+    payload = {
+        "id": user["id"], 
+        "role": user["role"], 
+        "email": user["email"], 
+        "exp": int(time.time()) + TOKEN_EXPIRY
+    }
     return serializer.dumps(payload)
 
 def decode_token(token: str) -> dict:
@@ -126,10 +127,16 @@ def token_required(f):
             return jsonify({"error": "Token requis"}), 401
         try:
             payload = decode_token(token)
-            user = supabase.table(TABLES["users"]).select("*").eq("id", payload["id"]).execute()
-            if not user.data:
-                return jsonify({"error": "Utilisateur introuvable"}), 401
-            g.current_user = user.data[0]
+            # Cache user lookup
+            cache_key = f"user:{payload['id']}"
+            user_data = cache.get(cache_key)
+            if user_data is None:
+                result = supabase.table(TABLES["users"]).select("*").eq("id", payload["id"]).execute()
+                if not result.data:
+                    return jsonify({"error": "Utilisateur introuvable"}), 401
+                user_data = result.data[0]
+                cache.set(cache_key, user_data, CACHE_TIMEOUT)
+            g.current_user = user_data
         except (SignatureExpired, BadSignature):
             return jsonify({"error": "Token invalide ou expiré"}), 401
         return f(*args, **kwargs)
@@ -147,15 +154,20 @@ def roles_required(*allowed):
     return decorator
 
 def add_audit(action: str, entity: str, details: str = None, entity_id: int = None):
+    """Ajoute un log d'audit (asynchrone, ne bloque pas)"""
     try:
         supabase.table(TABLES["audit"]).insert({
-            "action": action, "entity_type": entity, "entity_id": entity_id,
+            "action": action, 
+            "entity_type": entity, 
+            "entity_id": entity_id,
             "user_id": g.current_user.get("id") if hasattr(g, 'current_user') else None,
             "user_name": g.current_user.get("name") if hasattr(g, 'current_user') else "Systeme",
-            "details": details or "", "created_at": now_iso()
+            "details": details or "", 
+            "created_at": now_iso()
         }).execute()
     except:
-        pass
+        pass  # Ne pas bloquer l'opération principale
+
 
 # ==================== ROUTES AUTH ====================
 @app.route("/api/auth/login", methods=["POST"])
@@ -203,18 +215,29 @@ def register():
         return jsonify({"error": "Email déjà utilisé"}), 422
     
     user_data = {
-        "name": name, "email": email, "password_hash": generate_password_hash(password),
-        "role": role, "is_active": True, "created_at": now_iso(), "updated_at": now_iso()
+        "name": name, 
+        "email": email, 
+        "password_hash": generate_password_hash(password),
+        "role": role, 
+        "is_active": True, 
+        "created_at": now_iso(), 
+        "updated_at": now_iso()
     }
     result = supabase.table(TABLES["users"]).insert(user_data).execute()
     user = result.data[0]
     token = create_token(user)
     add_audit("CREATE", "user", f"Inscription: {email}", user["id"])
+    invalidate_cache()
     
-    return jsonify({"user": {k: v for k, v in user.items() if k != "password_hash"}, "token": token}), 201
+    return jsonify({
+        "user": {k: v for k, v in user.items() if k != "password_hash"}, 
+        "token": token
+    }), 201
 
 @app.route("/api/auth/logout", methods=["POST"])
+@token_required
 def logout():
+    add_audit("LOGOUT", "user", f"Déconnexion: {g.current_user.get('email')}", g.current_user.get("id"))
     return jsonify({"message": "Déconnexion réussie"})
 
 @app.route("/api/auth/me", methods=["GET"])
@@ -222,20 +245,23 @@ def logout():
 def auth_me():
     return jsonify({"user": {k: v for k, v in g.current_user.items() if k != "password_hash"}})
 
-# ==================== PATIENTS (COMPLET) ====================
+
+# ==================== PATIENTS ====================
 @app.route("/api/patients", methods=["GET"])
 @roles_required(*ROLES["staff"])
-@cached(120)
+@cached(CACHE_TIMEOUT)
 def get_patients():
     search = request.args.get("search", "").strip().lower()
-    result = supabase.table(TABLES["patients"]).select("*").order("created_at", desc=True).execute()
-    patients = result.data
     
+    # Utilisation de la recherche Supabase si disponible
     if search:
-        patients = [p for p in patients if search in p.get("full_name", "").lower() 
-                    or search in p.get("phone", "").lower() or search in p.get("email", "").lower()]
+        result = supabase.table(TABLES["patients"]).select("*")\
+            .or_(f"full_name.ilike.%{search}%,phone.ilike.%{search}%,email.ilike.%{search}%")\
+            .order("created_at", desc=True).execute()
+    else:
+        result = supabase.table(TABLES["patients"]).select("*").order("created_at", desc=True).execute()
     
-    return jsonify(patients)
+    return jsonify(result.data)
 
 @app.route("/api/patients", methods=["POST"])
 @roles_required("super_admin", "docteur", "infirmier", "reception")
@@ -261,7 +287,8 @@ def create_patient():
         "priority": data.get("priority", "normal"),
         "doctor_notes": data.get("doctor_notes", ""),
         "room_number": data.get("room_number", ""),
-        "created_at": now_iso(), "updated_at": now_iso()
+        "created_at": now_iso(), 
+        "updated_at": now_iso()
     }
     result = supabase.table(TABLES["patients"]).insert(patient).execute()
     add_audit("CREATE", "patient", f"Patient: {full_name}", result.data[0]["id"])
@@ -323,17 +350,35 @@ def get_patient_lab_results(patient_id: int):
     result = supabase.table(TABLES["lab_tests"]).select("*").eq("patient_id", patient_id).eq("status", "completed").order("completed_date", desc=True).execute()
     return jsonify(result.data)
 
-# ==================== APPOINTMENTS (COMPLET) ====================
+
+# ==================== APPOINTMENTS ====================
 @app.route("/api/appointments", methods=["GET"])
 @roles_required(*ROLES["staff"])
 @cached(60)
 def get_appointments():
-    result = supabase.table(TABLES["appointments"]).select("*").order("date", desc=True).execute()
+    # Support des filtres
+    status = request.args.get("status")
+    patient_id = request.args.get("patient_id")
+    date_from = request.args.get("date_from")
+    date_to = request.args.get("date_to")
+    
+    query = supabase.table(TABLES["appointments"]).select("*")
+    
+    if status:
+        query = query.eq("status", status)
+    if patient_id:
+        query = query.eq("patient_id", to_int(patient_id))
+    if date_from:
+        query = query.gte("date", date_from)
+    if date_to:
+        query = query.lte("date", date_to)
+    
+    result = query.order("date", desc=True).execute()
     appointments = result.data
     
-    # Enrichir avec noms patients
-    patients = supabase.table(TABLES["patients"]).select("id", "full_name").execute()
-    patient_map = {p["id"]: p["full_name"] for p in patients.data}
+    # Cache des noms patients
+    patients_result = supabase.table(TABLES["patients"]).select("id", "full_name").execute()
+    patient_map = {p["id"]: p["full_name"] for p in patients_result.data}
     for apt in appointments:
         apt["patient_name"] = patient_map.get(apt.get("patient_id"), "Inconnu")
     
@@ -358,12 +403,21 @@ def create_appointment():
         "priority": normalize_status(data.get("priority", "normal"), ["normal", "urgent"], "normal"),
         "doctor_id": g.current_user["id"],
         "doctor_name": g.current_user["name"],
-        "created_at": now_iso(), "updated_at": now_iso()
+        "created_at": now_iso(), 
+        "updated_at": now_iso()
     }
     result = supabase.table(TABLES["appointments"]).insert(appointment).execute()
     add_audit("CREATE", "appointment", f"RDV #{result.data[0]['id']}", result.data[0]["id"])
     invalidate_cache()
     return jsonify(result.data[0]), 201
+
+@app.route("/api/appointments/<int:appointment_id>", methods=["GET"])
+@roles_required(*ROLES["staff"])
+def get_appointment(appointment_id: int):
+    result = supabase.table(TABLES["appointments"]).select("*").eq("id", appointment_id).execute()
+    if not result.data:
+        return jsonify({"error": "Rendez-vous introuvable"}), 404
+    return jsonify(result.data[0])
 
 @app.route("/api/appointments/<int:appointment_id>", methods=["PUT"])
 @roles_required("super_admin", "docteur", "infirmier", "reception")
@@ -382,6 +436,30 @@ def update_appointment(appointment_id: int):
     invalidate_cache()
     return jsonify(result.data[0])
 
+@app.route("/api/appointments/<int:appointment_id>", methods=["PATCH"])
+@roles_required("super_admin", "docteur", "infirmier", "reception")
+def patch_appointment(appointment_id: int):
+    """Mise à jour partielle pour le frontend"""
+    data = fast_json()
+    allowed = ["status", "date", "type", "duration", "priority", "notes"]
+    updates = {k: v for k, v in data.items() if k in allowed and v is not None}
+    
+    if "status" in updates:
+        updates["status"] = normalize_status(updates["status"], ["scheduled", "completed", "cancelled"], "scheduled")
+    
+    if not updates:
+        return jsonify({"error": "Aucune donnée à mettre à jour"}), 422
+    
+    updates["updated_at"] = now_iso()
+    result = supabase.table(TABLES["appointments"]).update(updates).eq("id", appointment_id).execute()
+    
+    if not result.data:
+        return jsonify({"error": "Rendez-vous introuvable"}), 404
+    
+    add_audit("UPDATE", "appointment", f"RDV #{appointment_id} modifié (PATCH)", appointment_id)
+    invalidate_cache()
+    return jsonify(result.data[0])
+
 @app.route("/api/appointments/<int:appointment_id>", methods=["DELETE"])
 @roles_required("super_admin")
 def delete_appointment(appointment_id: int):
@@ -390,20 +468,8 @@ def delete_appointment(appointment_id: int):
     invalidate_cache()
     return jsonify({"message": "Rendez-vous supprimé"})
 
-@app.route("/api/appointments/<int:appointment_id>/status", methods=["PUT"])
-@roles_required("super_admin", "docteur", "infirmier", "reception")
-def update_appointment_status(appointment_id: int):
-    data = fast_json()
-    status = normalize_status(data.get("status", ""), ["scheduled", "completed", "cancelled"], "")
-    if not status:
-        return jsonify({"error": "Statut invalide"}), 422
-    
-    result = supabase.table(TABLES["appointments"]).update({"status": status, "updated_at": now_iso()}).eq("id", appointment_id).execute()
-    add_audit("UPDATE", "appointment", f"Statut RDV #{appointment_id} -> {status}", appointment_id)
-    invalidate_cache()
-    return jsonify(result.data[0])
 
-# ==================== PRESCRIPTIONS (COMPLET) ====================
+# ==================== PRESCRIPTIONS ====================
 @app.route("/api/prescriptions", methods=["GET"])
 @roles_required(*ROLES["staff"])
 @cached(120)
@@ -411,8 +477,9 @@ def get_prescriptions():
     result = supabase.table(TABLES["prescriptions"]).select("*").order("created_at", desc=True).execute()
     prescriptions = result.data
     
-    patients = supabase.table(TABLES["patients"]).select("id", "full_name").execute()
-    patient_map = {p["id"]: p["full_name"] for p in patients.data}
+    # Cache des noms patients
+    patients_result = supabase.table(TABLES["patients"]).select("id", "full_name").execute()
+    patient_map = {p["id"]: p["full_name"] for p in patients_result.data}
     for p in prescriptions:
         p["patient_name"] = patient_map.get(p.get("patient_id"), "Inconnu")
     
@@ -430,13 +497,15 @@ def create_prescription():
         "medication": data.get("medication"),
         "dosage": data.get("dosage", ""),
         "frequency": data.get("frequency", ""),
+        "duration": data.get("duration", ""),
         "start_date": data.get("start_date"),
         "end_date": data.get("end_date"),
         "instructions": data.get("instructions", ""),
         "status": data.get("status", "active"),
         "doctor_id": g.current_user["id"],
         "doctor_name": g.current_user["name"],
-        "created_at": now_iso(), "updated_at": now_iso()
+        "created_at": now_iso(), 
+        "updated_at": now_iso()
     }
     result = supabase.table(TABLES["prescriptions"]).insert(prescription).execute()
     add_audit("CREATE", "prescription", f"Prescription #{result.data[0]['id']}", result.data[0]["id"])
@@ -447,7 +516,7 @@ def create_prescription():
 @roles_required("super_admin", "docteur")
 def update_prescription(prescription_id: int):
     data = fast_json()
-    allowed = ["medication", "dosage", "frequency", "start_date", "end_date", "instructions", "status"]
+    allowed = ["medication", "dosage", "frequency", "duration", "start_date", "end_date", "instructions", "status"]
     updates = {k: v for k, v in data.items() if k in allowed and v is not None}
     updates["updated_at"] = now_iso()
     
@@ -466,16 +535,26 @@ def delete_prescription(prescription_id: int):
     invalidate_cache()
     return jsonify({"message": "Prescription supprimée"})
 
-# ==================== LABORATORY (COMPLET) ====================
+
+# ==================== LABORATORY ====================
 @app.route("/api/laboratory/tests", methods=["GET"])
 @roles_required(*ROLES["staff"])
 @cached(60)
 def get_lab_tests():
-    result = supabase.table(TABLES["lab_tests"]).select("*").order("request_date", desc=True).execute()
+    status = request.args.get("status")
+    patient_id = request.args.get("patient_id")
+    
+    query = supabase.table(TABLES["lab_tests"]).select("*")
+    if status:
+        query = query.eq("status", status)
+    if patient_id:
+        query = query.eq("patient_id", to_int(patient_id))
+    
+    result = query.order("request_date", desc=True).execute()
     tests = result.data
     
-    patients = supabase.table(TABLES["patients"]).select("id", "full_name").execute()
-    patient_map = {p["id"]: p["full_name"] for p in patients.data}
+    patients_result = supabase.table(TABLES["patients"]).select("id", "full_name").execute()
+    patient_map = {p["id"]: p["full_name"] for p in patients_result.data}
     for t in tests:
         t["patient_name"] = patient_map.get(t.get("patient_id"), "Inconnu")
     
@@ -497,7 +576,8 @@ def create_lab_test():
         "request_date": now_iso(),
         "requested_by": g.current_user["id"],
         "requested_by_name": g.current_user["name"],
-        "created_at": now_iso(), "updated_at": now_iso()
+        "created_at": now_iso(), 
+        "updated_at": now_iso()
     }
     result = supabase.table(TABLES["lab_tests"]).insert(test).execute()
     add_audit("CREATE", "lab_test", f"Analyse #{result.data[0]['id']}", result.data[0]["id"])
@@ -510,6 +590,21 @@ def get_lab_test(test_id: int):
     result = supabase.table(TABLES["lab_tests"]).select("*").eq("id", test_id).execute()
     if not result.data:
         return jsonify({"error": "Analyse introuvable"}), 404
+    return jsonify(result.data[0])
+
+@app.route("/api/laboratory/tests/<int:test_id>", methods=["PUT"])
+@roles_required("super_admin", "laboratoire")
+def update_lab_test(test_id: int):
+    data = fast_json()
+    allowed = ["test_type", "notes", "priority"]
+    updates = {k: v for k, v in data.items() if k in allowed and v is not None}
+    updates["updated_at"] = now_iso()
+    
+    result = supabase.table(TABLES["lab_tests"]).update(updates).eq("id", test_id).execute()
+    if not result.data:
+        return jsonify({"error": "Analyse introuvable"}), 404
+    add_audit("UPDATE", "lab_test", f"Analyse #{test_id} modifiée", test_id)
+    invalidate_cache()
     return jsonify(result.data[0])
 
 @app.route("/api/laboratory/tests/<int:test_id>/result", methods=["PUT"])
@@ -543,11 +638,20 @@ def get_test_result(test_id: int):
 @roles_required(*ROLES["staff"])
 @cached(120)
 def get_lab_results():
-    result = supabase.table(TABLES["lab_tests"]).select("*").eq("status", "completed").order("completed_date", desc=True).execute()
+    date_from = request.args.get("from_date")
+    date_to = request.args.get("to_date")
+    
+    query = supabase.table(TABLES["lab_tests"]).select("*").eq("status", "completed")
+    if date_from:
+        query = query.gte("completed_date", date_from)
+    if date_to:
+        query = query.lte("completed_date", date_to)
+    
+    result = query.order("completed_date", desc=True).execute()
     tests = result.data
     
-    patients = supabase.table(TABLES["patients"]).select("id", "full_name").execute()
-    patient_map = {p["id"]: p["full_name"] for p in patients.data}
+    patients_result = supabase.table(TABLES["patients"]).select("id", "full_name").execute()
+    patient_map = {p["id"]: p["full_name"] for p in patients_result.data}
     for t in tests:
         t["patient_name"] = patient_map.get(t.get("patient_id"), "Inconnu")
     
@@ -561,7 +665,8 @@ def delete_lab_test(test_id: int):
     invalidate_cache()
     return jsonify({"message": "Analyse supprimée"})
 
-# ==================== CARE LOGS (COMPLET) ====================
+
+# ==================== CARE LOGS ====================
 @app.route("/api/care", methods=["GET"])
 @roles_required(*ROLES["staff"])
 @cached(60)
@@ -569,8 +674,8 @@ def get_care_logs():
     result = supabase.table(TABLES["care"]).select("*").order("date", desc=True).execute()
     care_logs = result.data
     
-    patients = supabase.table(TABLES["patients"]).select("id", "full_name").execute()
-    patient_map = {p["id"]: p["full_name"] for p in patients.data}
+    patients_result = supabase.table(TABLES["patients"]).select("id", "full_name").execute()
+    patient_map = {p["id"]: p["full_name"] for p in patients_result.data}
     for c in care_logs:
         c["patient_name"] = patient_map.get(c.get("patient_id"), "Inconnu")
     
@@ -590,7 +695,8 @@ def create_care_log():
         "date": now_iso(),
         "performed_by": g.current_user["id"],
         "performed_by_name": g.current_user["name"],
-        "created_at": now_iso(), "updated_at": now_iso()
+        "created_at": now_iso(), 
+        "updated_at": now_iso()
     }
     result = supabase.table(TABLES["care"]).insert(care).execute()
     add_audit("CREATE", "care", f"Soin #{result.data[0]['id']}", result.data[0]["id"])
@@ -623,13 +729,21 @@ def delete_care_log(care_id: int):
     invalidate_cache()
     return jsonify({"message": "Soin supprimé"})
 
-# ==================== PHARMACY (COMPLET) ====================
+
+# ==================== PHARMACY ====================
 @app.route("/api/pharmacy", methods=["GET"])
 @roles_required(*ROLES["staff"])
 @cached(60)
 def get_pharmacy():
+    low_stock = request.args.get("low_stock", "false").lower() == "true"
+    
     result = supabase.table(TABLES["pharmacy"]).select("*").order("medication_name").execute()
-    return jsonify(result.data)
+    items = result.data
+    
+    if low_stock:
+        items = [i for i in items if i.get("quantity", 0) <= i.get("threshold", 10)]
+    
+    return jsonify(items)
 
 @app.route("/api/pharmacy", methods=["POST"])
 @roles_required("super_admin", "pharmacie")
@@ -644,7 +758,8 @@ def create_pharmacy_item():
         "unit": data.get("unit", "comprimé(s)"),
         "threshold": max(0, to_int(data.get("threshold"), 10)),
         "expiry_date": data.get("expiry_date"),
-        "created_at": now_iso(), "updated_at": now_iso()
+        "created_at": now_iso(), 
+        "updated_at": now_iso()
     }
     result = supabase.table(TABLES["pharmacy"]).insert(item).execute()
     add_audit("CREATE", "pharmacy", f"Médicament: {data['medication_name']}", result.data[0]["id"])
@@ -657,6 +772,21 @@ def get_pharmacy_item(item_id: int):
     result = supabase.table(TABLES["pharmacy"]).select("*").eq("id", item_id).execute()
     if not result.data:
         return jsonify({"error": "Médicament introuvable"}), 404
+    return jsonify(result.data[0])
+
+@app.route("/api/pharmacy/<int:item_id>", methods=["PUT"])
+@roles_required("super_admin", "pharmacie")
+def update_pharmacy_item(item_id: int):
+    data = fast_json()
+    allowed = ["medication_name", "unit", "threshold", "expiry_date"]
+    updates = {k: v for k, v in data.items() if k in allowed and v is not None}
+    updates["updated_at"] = now_iso()
+    
+    result = supabase.table(TABLES["pharmacy"]).update(updates).eq("id", item_id).execute()
+    if not result.data:
+        return jsonify({"error": "Médicament introuvable"}), 404
+    add_audit("UPDATE", "pharmacy", f"Médicament #{item_id} modifié", item_id)
+    invalidate_cache()
     return jsonify(result.data[0])
 
 @app.route("/api/pharmacy/<int:item_id>/stock", methods=["PUT"])
@@ -685,6 +815,80 @@ def update_stock(item_id: int):
     invalidate_cache()
     return jsonify(result.data[0])
 
+@app.route("/api/pharmacy/sell", methods=["POST"])
+@roles_required("super_admin", "pharmacie")
+def pharmacy_sell():
+    """Vente médicament avec génération automatique de facture"""
+    data = fast_json()
+    
+    patient_id = to_int(data.get("patient_id"))
+    medication_id = to_int(data.get("medication_id"))
+    quantity = to_int(data.get("quantity"), 0)
+    unit_price = to_float(data.get("unit_price"), 0)
+    description = data.get("description", "")
+    
+    if not patient_id or not medication_id or quantity <= 0 or unit_price <= 0:
+        return jsonify({"error": "Paramètres invalides"}), 422
+    
+    # Vérifier patient
+    patient_check = supabase.table(TABLES["patients"]).select("id", "full_name").eq("id", patient_id).execute()
+    if not patient_check.data:
+        return jsonify({"error": "Patient introuvable"}), 404
+    
+    # Récupérer médicament
+    med_result = supabase.table(TABLES["pharmacy"]).select("*").eq("id", medication_id).execute()
+    if not med_result.data:
+        return jsonify({"error": "Médicament introuvable"}), 404
+    
+    medication = med_result.data[0]
+    current_stock = to_int(medication.get("quantity"), 0)
+    
+    if quantity > current_stock:
+        return jsonify({"error": f"Stock insuffisant. Disponible: {current_stock}"}), 422
+    
+    amount = round(quantity * unit_price, 2)
+    
+    # Créer facture
+    invoice_data = {
+        "invoice_number": f"FAC-{int(time.time())}-{secrets.token_hex(2).upper()}",
+        "patient_id": patient_id,
+        "amount": amount,
+        "description": description or f"Vente pharmacie - {medication['medication_name']} x{quantity}",
+        "status": "unpaid",
+        "line_items": [{
+            "medication_id": medication_id,
+            "medication_name": medication["medication_name"],
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "total": amount
+        }],
+        "created_by": g.current_user["id"],
+        "created_by_name": g.current_user["name"],
+        "created_at": now_iso(),
+        "updated_at": now_iso()
+    }
+    
+    invoice_result = supabase.table(TABLES["billing"]).insert(invoice_data).execute()
+    if not invoice_result.data:
+        return jsonify({"error": "Erreur création facture"}), 500
+    
+    # Réduire stock
+    new_stock = current_stock - quantity
+    supabase.table(TABLES["pharmacy"]).update({
+        "quantity": new_stock, 
+        "updated_at": now_iso()
+    }).eq("id", medication_id).execute()
+    
+    add_audit("CREATE", "billing", f"Vente pharmacie #{invoice_result.data[0]['id']}: {amount}", invoice_result.data[0]["id"])
+    add_audit("UPDATE", "pharmacy", f"Vente #{medication_id}: {quantity} unités", medication_id)
+    invalidate_cache()
+    
+    invoice = invoice_result.data[0]
+    invoice["patient_name"] = patient_check.data[0]["full_name"]
+    invoice["line_items"] = invoice_data["line_items"]
+    
+    return jsonify(invoice), 201
+
 @app.route("/api/pharmacy/<int:item_id>", methods=["DELETE"])
 @roles_required("super_admin")
 def delete_pharmacy_item(item_id: int):
@@ -693,16 +897,26 @@ def delete_pharmacy_item(item_id: int):
     invalidate_cache()
     return jsonify({"message": "Médicament supprimé"})
 
-# ==================== BILLING (COMPLET) ====================
+
+# ==================== BILLING ====================
 @app.route("/api/billing", methods=["GET"])
 @roles_required(*ROLES["staff"])
 @cached(60)
 def get_invoices():
-    result = supabase.table(TABLES["billing"]).select("*").order("created_at", desc=True).execute()
+    status = request.args.get("status")
+    patient_id = request.args.get("patient_id")
+    
+    query = supabase.table(TABLES["billing"]).select("*")
+    if status:
+        query = query.eq("status", status)
+    if patient_id:
+        query = query.eq("patient_id", to_int(patient_id))
+    
+    result = query.order("created_at", desc=True).execute()
     invoices = result.data
     
-    patients = supabase.table(TABLES["patients"]).select("id", "full_name").execute()
-    patient_map = {p["id"]: p["full_name"] for p in patients.data}
+    patients_result = supabase.table(TABLES["patients"]).select("id", "full_name").execute()
+    patient_map = {p["id"]: p["full_name"] for p in patients_result.data}
     for inv in invoices:
         inv["patient_name"] = patient_map.get(inv.get("patient_id"), "Inconnu")
     
@@ -715,7 +929,18 @@ def create_invoice():
     if not data.get("patient_id"):
         return jsonify({"error": "Patient requis"}), 422
     
-    amount = round(to_float(data.get("amount"), 0), 2)
+    # Support line_items du frontend
+    line_items = data.get("line_items") or data.get("items") or []
+    
+    # Calculer montant à partir des items si présent
+    calculated_amount = 0
+    for item in line_items:
+        qty = to_int(item.get("quantity"), 0)
+        price = to_float(item.get("unit_price") or item.get("price"), 0)
+        calculated_amount += qty * price
+    
+    amount = round(calculated_amount if calculated_amount > 0 else to_float(data.get("amount"), 0), 2)
+    
     if amount <= 0:
         return jsonify({"error": "Montant invalide"}), 422
     
@@ -725,15 +950,24 @@ def create_invoice():
         "amount": amount,
         "description": data.get("description", ""),
         "status": "unpaid",
-        "line_items": data.get("items", []),
+        "line_items": line_items,
         "created_by": g.current_user["id"],
         "created_by_name": g.current_user["name"],
-        "created_at": now_iso(), "updated_at": now_iso()
+        "created_at": now_iso(), 
+        "updated_at": now_iso()
     }
     result = supabase.table(TABLES["billing"]).insert(invoice).execute()
     add_audit("CREATE", "billing", f"Facture #{result.data[0]['id']}: {amount}", result.data[0]["id"])
     invalidate_cache()
     return jsonify(result.data[0]), 201
+
+@app.route("/api/billing/<int:invoice_id>", methods=["GET"])
+@roles_required(*ROLES["staff"])
+def get_invoice(invoice_id: int):
+    result = supabase.table(TABLES["billing"]).select("*").eq("id", invoice_id).execute()
+    if not result.data:
+        return jsonify({"error": "Facture introuvable"}), 404
+    return jsonify(result.data[0])
 
 @app.route("/api/billing/<int:invoice_id>", methods=["PUT"])
 @roles_required("super_admin", "reception")
@@ -781,7 +1015,8 @@ def delete_invoice(invoice_id: int):
     invalidate_cache()
     return jsonify({"message": "Facture supprimée"})
 
-# ==================== USERS (COMPLET) ====================
+
+# ==================== USERS ====================
 @app.route("/api/users", methods=["GET"])
 @app.route("/api/auth/users", methods=["GET"])
 @roles_required("super_admin")
@@ -815,8 +1050,13 @@ def create_user():
         return jsonify({"error": "Email déjà utilisé"}), 422
     
     user_data = {
-        "name": name, "email": email, "password_hash": generate_password_hash(password),
-        "role": role, "is_active": True, "created_at": now_iso(), "updated_at": now_iso()
+        "name": name, 
+        "email": email, 
+        "password_hash": generate_password_hash(password),
+        "role": role, 
+        "is_active": True, 
+        "created_at": now_iso(), 
+        "updated_at": now_iso()
     }
     result = supabase.table(TABLES["users"]).insert(user_data).execute()
     add_audit("CREATE", "user", f"Compte: {email}", result.data[0]["id"])
@@ -866,35 +1106,59 @@ def delete_user(user_id: int):
     invalidate_cache()
     return jsonify({"message": "Compte supprimé"})
 
+
 # ==================== AUDIT ====================
 @app.route("/api/audit", methods=["GET"])
 @roles_required("super_admin")
-@cached(60)
+@cached(120)
 def get_audit_logs():
-    result = supabase.table(TABLES["audit"]).select("*").order("created_at", desc=True).limit(500).execute()
+    action = request.args.get("action")
+    entity = request.args.get("entity_type")
+    user_id = request.args.get("user_id")
+    limit = to_int(request.args.get("limit"), 500)
+    
+    query = supabase.table(TABLES["audit"]).select("*")
+    if action:
+        query = query.eq("action", action)
+    if entity:
+        query = query.eq("entity_type", entity)
+    if user_id:
+        query = query.eq("user_id", to_int(user_id))
+    
+    result = query.order("created_at", desc=True).limit(min(limit, 1000)).execute()
     return jsonify(result.data)
+
 
 # ==================== HEALTH ====================
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "timestamp": now_iso(), "version": "2.0.0"})
+    return jsonify({
+        "status": "ok", 
+        "timestamp": now_iso(), 
+        "version": "2.0.0"
+    })
 
-# ==================== SEED SUPER ADMIN ====================
+
+# ==================== SEED ====================
 def seed_admin():
     existing = supabase.table(TABLES["users"]).select("id").eq("email", "jeremyodimba322@gmail.com").execute()
     if not existing.data:
         supabase.table(TABLES["users"]).insert({
-            "name": "Administrateur", "email": "jeremyodimba322@gmail.com",
-            "password_hash": generate_password_hash("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"),
-            "role": "super_admin", "is_active": True,
-            "created_at": now_iso(), "updated_at": now_iso()
+            "name": "Administrateur", 
+            "email": "jeremyodimba322@gmail.com",
+            "password_hash": generate_password_hash("admin123"),
+            "role": "super_admin", 
+            "is_active": True,
+            "created_at": now_iso(), 
+            "updated_at": now_iso()
         }).execute()
-        print("✅ Super admin créé")
+        print("✅ Super admin créé (email: jeremyodimba322@gmail.com, mot de passe: admin123)")
+
 
 # ==================== LANCEMENT ====================
 if __name__ == "__main__":
     print("=" * 50)
-    print("🏥 I HUB HOSPITAL API - BACKEND COMPLET")
+    print("🏥 I HUB HOSPITAL API - VERSION COMPLÈTE")
     print("=" * 50)
     seed_admin()
     print(f"🚀 Serveur démarré sur http://{HOST}:{PORT}")
