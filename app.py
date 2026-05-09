@@ -23,13 +23,13 @@ import io
 # ==================== CONFIGURATION ====================
 SUPABASE_URL = "https://figmeixteescztmmprmi.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpZ21laXh0ZWVzY3p0bW1wcm1pIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTM4NjA2MCwiZXhwIjoyMDkwOTYyMDYwfQ.zMIDYvm-Bwv0EUQzME3nZR8ZPoSwTMCaybHRnw_-7Ew"
-SECRET_KEY = secrets.token_hex(32)
-GROQ_API_KEY = os.environ.get("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", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+SECRET_KEY = "ihub_super_secret_key_2024"
+GROQ_API_KEY = "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"
+GROQ_MODEL = "llama-3.1-8b-instant"
 HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", 10000))
-DEBUG = False
-TOKEN_EXPIRY = 86400 * 7  # 7 jours
+PORT = 10000
+DEBUG = True
+TOKEN_EXPIRY = 86400 * 7
 CACHE_TIMEOUT = 300
 
 # ==================== INITIALISATION ====================
