@@ -7,6 +7,8 @@ import time
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Any
+import urllib.error
+import urllib.request
 
 from flask import Flask, jsonify, request, g
 from flask_cors import CORS
@@ -18,10 +20,12 @@ from werkzeug.security import generate_password_hash, check_password_hash
 # ==================== CONFIGURATION ====================
 SUPABASE_URL = "https://figmeixteescztmmprmi.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpZ21laXh0ZWVzY3p0bW1wcm1pIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTM4NjA2MCwiZXhwIjoyMDkwOTYyMDYwfQ.zMIDYvm-Bwv0EUQzME3nZR8ZPoSwTMCaybHRnw_-7Ew"
-SECRET_KEY = "ihub_super_secret_key_2024"
+SECRET_KEY = "SECRET_KEY", "ihub_super_secret_key_2024"
+GROQ_API_KEY = "GROQ_API_KEY"
+GROQ_MODEL = "GROQ_MODEL", "llama-3.1-8b-instant"
 HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", 10000))
-DEBUG = False
+PORT = 10000
+DEBUG =  "true"
 TOKEN_EXPIRY = 86400 * 7
 CACHE_TIMEOUT = 300
 
@@ -33,6 +37,9 @@ app.config["CACHE_DEFAULT_TIMEOUT"] = CACHE_TIMEOUT
 
 cache = Cache(app)
 CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
+
+if not SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY est requis")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 serializer = URLSafeTimedSerializer(SECRET_KEY)
@@ -50,8 +57,8 @@ TABLES = {
 }
 
 ROLES = {
-    "public": ["docteur", "infirmier", "laboratoire", "pharmacie", "reception", "sage_femme", "gynecologue", "pediatre", "vaccinateur"],
-    "staff": ["super_admin", "docteur", "infirmier", "laboratoire", "pharmacie", "reception", "sage_femme", "gynecologue", "pediatre", "vaccinateur"],
+    "public": ["docteur", "infirmier", "laboratoire", "pharmacie", "reception", "sage_femme", "gynecologue", "pediatre"],
+    "staff": ["super_admin", "docteur", "infirmier", "laboratoire", "pharmacie", "reception", "sage_femme", "gynecologue", "pediatre"],
 }
 
 
@@ -104,6 +111,64 @@ def cached(timeout=CACHE_TIMEOUT, key_prefix=None):
         return decorated
     return decorator
 
+
+
+def parse_date(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+    except Exception:
+        return None
+
+
+def age_years(patient: dict):
+    birth = parse_date(patient.get("date_of_birth") or patient.get("birth_date") or patient.get("dob"))
+    if not birth:
+        return None
+    today = datetime.now(timezone.utc).date()
+    return today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
+
+
+def is_female(patient: dict) -> bool:
+    return str(patient.get("gender", "")).lower() in ("f", "female", "feminin", "féminin", "femme")
+
+
+def active_pregnant_patient_ids() -> set:
+    try:
+        result = supabase.table("pregnancies").select("patient_id,status").eq("status", "active").execute()
+        return {str(row.get("patient_id")) for row in (result.data or []) if row.get("patient_id")}
+    except Exception:
+        return set()
+
+
+def filter_patients_for_role(patients: list) -> list:
+    role = g.current_user.get("role") if hasattr(g, "current_user") else ""
+    if role == "pediatre":
+        return [p for p in patients if age_years(p) is not None and age_years(p) < 18]
+    if role == "gynecologue":
+        return [p for p in patients if is_female(p)]
+    if role == "sage_femme":
+        pregnant_ids = active_pregnant_patient_ids()
+        return [p for p in patients if is_female(p) and str(p.get("id")) in pregnant_ids]
+    return patients
+
+
+def filter_appointments_for_role(appointments: list) -> list:
+    role = g.current_user.get("role") if hasattr(g, "current_user") else ""
+    if role != "gynecologue":
+        return appointments
+    user_id = str(g.current_user.get("id", ""))
+    user_name = str(g.current_user.get("name", "")).lower()
+    id_fields = ("doctor_id", "practitioner_id", "provider_id", "user_id", "created_by", "assigned_to")
+    name_fields = ("doctor_name", "practitioner_name", "provider_name", "user_name")
+    filtered = []
+    for apt in appointments:
+        if user_id and any(str(apt.get(field, "")) == user_id for field in id_fields):
+            filtered.append(apt)
+        elif user_name and any(str(apt.get(field, "")).lower() == user_name for field in name_fields):
+            filtered.append(apt)
+    return filtered
 
 # ==================== AUTHENTIFICATION ====================
 def create_token(user: dict) -> str:
@@ -255,7 +320,6 @@ def auth_me():
 # ==================== PATIENTS ====================
 @app.route("/api/patients", methods=["GET"])
 @roles_required(*ROLES["staff"])
-@cached(CACHE_TIMEOUT)
 def get_patients():
     search = request.args.get("search", "").strip().lower()
 
@@ -266,11 +330,11 @@ def get_patients():
     else:
         result = supabase.table(TABLES["patients"]).select("*").order("created_at", desc=True).execute()
 
-    return jsonify(result.data)
+    return jsonify(filter_patients_for_role(result.data or []))
 
 
 @app.route("/api/patients", methods=["POST"])
-@roles_required("super_admin", "docteur", "infirmier", "reception", "sage_femme", "gynecologue")
+@roles_required("super_admin", "reception")
 def create_patient():
     data = fast_json()
     full_name = data.get("full_name", "").strip()
@@ -366,7 +430,6 @@ def get_patient_lab_results(patient_id: int):
 # ==================== APPOINTMENTS ====================
 @app.route("/api/appointments", methods=["GET"])
 @roles_required(*ROLES["staff"])
-@cached(60)
 def get_appointments():
     status = request.args.get("status")
     patient_id = request.args.get("patient_id")
@@ -385,7 +448,7 @@ def get_appointments():
         query = query.lte("date", date_to)
 
     result = query.order("date", desc=True).execute()
-    appointments = result.data
+    appointments = filter_appointments_for_role(result.data or [])
 
     patients_result = supabase.table(TABLES["patients"]).select("id", "full_name").execute()
     patient_map = {p["id"]: p["full_name"] for p in patients_result.data}
@@ -451,7 +514,7 @@ def update_appointment(appointment_id: int):
 
 
 @app.route("/api/appointments/<int:appointment_id>", methods=["PATCH"])
-@roles_required("super_admin", "docteur", "infirmier", "reception")
+@roles_required("super_admin", "docteur", "infirmier", "reception", "gynecologue", "pediatre")
 def patch_appointment(appointment_id: int):
     data = fast_json()
     allowed = ["status", "date", "type", "duration", "priority", "notes"]
@@ -782,7 +845,9 @@ def create_pharmacy_item():
     item = {
         "medication_name": data["medication_name"],
         "quantity": max(0, to_int(data.get("quantity"), 0)),
-        "unit": data.get("unit", "comprimé(s)"),
+        "unit": data.get("unit", "comprimÃ©(s)"),
+        "purchase_price": max(0, to_float(data.get("purchase_price"), 0)),
+        "selling_price": max(0, to_float(data.get("selling_price"), 0)),
         "threshold": max(0, to_int(data.get("threshold"), 10)),
         "expiry_date": data.get("expiry_date"),
         "created_at": now_iso(),
@@ -807,7 +872,7 @@ def get_pharmacy_item(item_id: int):
 @roles_required("super_admin", "pharmacie")
 def update_pharmacy_item(item_id: int):
     data = fast_json()
-    allowed = ["medication_name", "unit", "threshold", "expiry_date"]
+    allowed = ["medication_name", "unit", "purchase_price", "selling_price", "threshold", "expiry_date"]
     updates = {k: v for k, v in data.items() if k in allowed and v is not None}
     updates["updated_at"] = now_iso()
 
@@ -917,6 +982,66 @@ def create_invoice():
     invalidate_cache()
     return jsonify(result.data[0]), 201
 
+
+
+@app.route("/api/billing/grouped", methods=["POST"])
+@roles_required("super_admin", "pharmacie", "reception")
+def create_grouped_invoice():
+    data = fast_json()
+    items = data.get("items") or data.get("line_items") or []
+    if not data.get("patient_id"):
+        return jsonify({"error": "Patient requis"}), 422
+    if not items:
+        return jsonify({"error": "Aucun article à facturer"}), 422
+
+    normalized_items = []
+    total = 0.0
+    for item in items:
+        qty = max(1, to_int(item.get("quantity"), 1))
+        unit_price = max(0, to_float(item.get("unit_price") or item.get("price"), 0))
+        amount = round(to_float(item.get("amount"), qty * unit_price), 2)
+        total += amount
+        normalized_items.append({
+            "medication_id": item.get("medication_id"),
+            "code": item.get("code", ""),
+            "description": item.get("description", ""),
+            "quantity": qty,
+            "unit_price": unit_price,
+            "amount": amount
+        })
+
+    if total <= 0:
+        return jsonify({"error": "Montant invalide"}), 422
+
+    invoice = {
+        "invoice_number": f"FAC-{int(time.time())}-{secrets.token_hex(2).upper()}",
+        "patient_id": to_int(data.get("patient_id")),
+        "amount": round(total, 2),
+        "description": data.get("description", "Facture groupée"),
+        "status": "unpaid",
+        "line_items": normalized_items,
+        "items": normalized_items,
+        "created_by": g.current_user["id"],
+        "created_by_name": g.current_user["name"],
+        "created_at": now_iso(),
+        "updated_at": now_iso()
+    }
+    result = supabase.table(TABLES["billing"]).insert(invoice).execute()
+
+    if data.get("source") == "pharmacy":
+        for item in normalized_items:
+            med_id = to_int(item.get("medication_id"), 0)
+            qty = to_int(item.get("quantity"), 0)
+            if not med_id or not qty:
+                continue
+            current = supabase.table(TABLES["pharmacy"]).select("quantity").eq("id", med_id).execute()
+            if current.data:
+                new_qty = max(0, to_int(current.data[0].get("quantity"), 0) - qty)
+                supabase.table(TABLES["pharmacy"]).update({"quantity": new_qty, "updated_at": now_iso()}).eq("id", med_id).execute()
+
+    add_audit("CREATE", "billing", f"Facture groupée: {round(total, 2)}", result.data[0]["id"])
+    invalidate_cache()
+    return jsonify({"invoice": result.data[0]}), 201
 
 @app.route("/api/billing/<int:invoice_id>", methods=["GET"])
 @roles_required(*ROLES["staff"])
@@ -1349,6 +1474,26 @@ def get_pregnancy(pregnancy_id: int):
     return jsonify(pregnancy)
 
 
+
+@app.route("/api/maternity/pregnancies/<int:pregnancy_id>", methods=["PUT"])
+@roles_required("super_admin", "sage_femme", "gynecologue")
+def update_pregnancy(pregnancy_id: int):
+    data = fast_json()
+    allowed = [
+        "last_menstrual_period", "expected_delivery_date", "blood_type",
+        "risk_level", "medical_history", "status", "notes"
+    ]
+    updates = {key: value for key, value in data.items() if key in allowed and value is not None}
+    if not updates:
+        return jsonify({"error": "Aucune donnée à mettre à jour"}), 422
+    updates["updated_at"] = now_iso()
+    result = supabase.table("pregnancies").update(updates).eq("id", pregnancy_id).execute()
+    if not result.data:
+        return jsonify({"error": "Grossesse introuvable"}), 404
+    add_audit("UPDATE", "pregnancy", f"Grossesse #{pregnancy_id} modifiée", pregnancy_id)
+    invalidate_cache()
+    return jsonify(result.data[0])
+
 @app.route("/api/maternity/pregnancies/<int:pregnancy_id>/followups", methods=["GET"])
 @roles_required("super_admin", "sage_femme", "gynecologue")
 def get_pregnancy_followups(pregnancy_id: int):
@@ -1597,7 +1742,7 @@ def discharge_from_maternity(room_id: int):
 # ==================== PÉDIATRIE ROUTES ====================
 
 @app.route("/api/pediatrics/children", methods=["GET"])
-@roles_required("super_admin", "pediatre", "vaccinateur", "sage_femme")
+@roles_required("super_admin", "pediatre", "sage_femme")
 @cached(60)
 def get_children():
     parent_id = request.args.get("parent_id")
@@ -1645,7 +1790,7 @@ def create_child():
 
 
 @app.route("/api/pediatrics/children/<int:child_id>", methods=["GET"])
-@roles_required("super_admin", "pediatre", "vaccinateur")
+@roles_required("super_admin", "pediatre")
 def get_child(child_id: int):
     result = supabase.table("children").select("*").eq("id", child_id).execute()
     if not result.data:
@@ -1678,7 +1823,7 @@ def update_child(child_id: int):
 
 
 @app.route("/api/pediatrics/vaccinations", methods=["GET"])
-@roles_required("super_admin", "pediatre", "vaccinateur")
+@roles_required("super_admin", "pediatre")
 @cached(60)
 def get_vaccinations():
     child_id = request.args.get("child_id")
@@ -1699,7 +1844,7 @@ def get_vaccinations():
 
 
 @app.route("/api/pediatrics/vaccinations", methods=["POST"])
-@roles_required("super_admin", "pediatre", "vaccinateur")
+@roles_required("super_admin", "pediatre")
 def create_vaccination():
     data = fast_json()
     
@@ -1731,7 +1876,7 @@ def create_vaccination():
 
 
 @app.route("/api/pediatrics/vaccinations/<int:vaccination_id>", methods=["GET"])
-@roles_required("super_admin", "pediatre", "vaccinateur")
+@roles_required("super_admin", "pediatre")
 def get_vaccination(vaccination_id: int):
     result = supabase.table("vaccinations").select("*").eq("id", vaccination_id).execute()
     if not result.data:
@@ -1757,7 +1902,7 @@ def update_vaccination(vaccination_id: int):
 
 
 @app.route("/api/pediatrics/children/<int:child_id>/vaccinations", methods=["GET"])
-@roles_required("super_admin", "pediatre", "vaccinateur")
+@roles_required("super_admin", "pediatre")
 def get_child_vaccinations(child_id: int):
     result = supabase.table("vaccinations").select("*").eq("child_id", child_id).order("administered_date", desc=True).execute()
     return jsonify(result.data)
@@ -1824,6 +1969,80 @@ def get_child_growth(child_id: int):
     result = supabase.table("growth_measurements").select("*").eq("child_id", child_id).order("measurement_date", asc=True).execute()
     return jsonify(result.data)
 
+
+
+# ==================== AI ROUTES ====================
+AI_DISCLAIMER = "Assistant médical uniquement: validation clinique obligatoire par un professionnel habilité."
+
+
+def groq_chat(system_prompt: str, user_prompt: str) -> str:
+    if not GROQ_API_KEY:
+        return "IA non configurée: GROQ_API_KEY manquant côté serveur."
+    payload = json.dumps({
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": f"{system_prompt}\n{AI_DISCLAIMER}"},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.2,
+        "max_tokens": 900
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=payload,
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as response:
+            body = json.loads(response.read().decode("utf-8"))
+            return body["choices"][0]["message"]["content"]
+    except Exception as exc:
+        return f"IA indisponible temporairement: {exc}"
+
+
+def ai_payload(key: str, value: str):
+    return jsonify({key: value, "disclaimer": AI_DISCLAIMER})
+
+
+@app.route("/api/ai/patient-summary", methods=["POST"])
+@roles_required("super_admin", "docteur", "sage_femme", "gynecologue", "pediatre")
+def ai_patient_summary():
+    data = fast_json()
+    patient_id = to_int(data.get("patient_id"))
+    patient_result = supabase.table(TABLES["patients"]).select("*").eq("id", patient_id).execute()
+    if not patient_result.data:
+        return jsonify({"error": "Patient introuvable"}), 404
+    patient = filter_patients_for_role(patient_result.data)
+    if not patient:
+        return jsonify({"error": "Accès patient interdit pour ce rôle"}), 403
+    summary = groq_chat(
+        "Résume un dossier patient de façon structurée et prudente, sans diagnostic final.",
+        json.dumps(patient[0], ensure_ascii=False)
+    )
+    return ai_payload("summary", summary)
+
+
+@app.route("/api/ai/clinical-decision", methods=["POST"])
+@roles_required("super_admin", "docteur", "sage_femme", "gynecologue", "pediatre")
+def ai_clinical_decision():
+    context = fast_json().get("context", "")
+    analysis = groq_chat(
+        "Aide à l'orientation clinique. Donne priorités, signes d'alerte, examens utiles et limites. Ne pose pas de diagnostic final.",
+        context
+    )
+    return ai_payload("analysis", analysis)
+
+
+@app.route("/api/ai/hospital-flow", methods=["POST"])
+@roles_required(*ROLES["staff"])
+def ai_hospital_flow():
+    data = fast_json()
+    prediction = groq_chat(
+        "Prédis l'affluence hospitalière à court terme et propose des recommandations opérationnelles.",
+        json.dumps(data, ensure_ascii=False)[:12000]
+    )
+    return ai_payload("prediction", prediction)
 
 # ==================== LANCEMENT ====================
 if __name__ == "__main__":
