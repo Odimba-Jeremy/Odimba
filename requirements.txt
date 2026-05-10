@@ -1,5 +1,6 @@
 Flask==2.3.3
 uvicorn
+Fastapi 
 Flask-CORS==4.0.0
 supabase==2.28.3
 python-dotenv==1.0.0
