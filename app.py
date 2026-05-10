@@ -2,19 +2,19 @@
 iHub Backend — monolithic FastAPI app.
 
 Run:
-    pip install -r requirements.txt
-    python app.py
+    Development: uvicorn app:app --reload
+    Production:  gunicorn -k uvicorn.workers.UvicornWorker app:app
 
 Swagger UI: http://localhost:10000/docs
 """
 
 import os
 import time
+import uvicorn
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 
 import httpx
-import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -35,9 +35,8 @@ GROQ_API_KEY = "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"
 GROQ_MODEL = "llama-3.1-8b-instant"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-HOST = "0.0.0.0"
-PORT = 10000
-DEBUG = False
+PORT = int(os.environ.get("PORT", 10000))
+DEBUG = os.environ.get("DEBUG", "False").lower() == "true"
 
 TOKEN_EXPIRY = 86400 * 7  # 7 days, in seconds
 CACHE_TIMEOUT = 300       # 5 minutes
@@ -113,12 +112,6 @@ def cache_set(key: str, value: Any, ttl: int = CACHE_TIMEOUT) -> None:
 
 def cache_delete(key: str) -> None:
     _cache.pop(key, None)
-
-
-def cache_invalidate_prefix(prefix: str) -> None:
-    for k in list(_cache.keys()):
-        if k.startswith(prefix):
-            _cache.pop(k, None)
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +217,6 @@ def health():
 # ---------------------------------------------------------------------------
 @app.post("/auth/register", response_model=TokenOut, status_code=201)
 def register(payload: RegisterIn):
-    # Vérification de l'existence de l'email
     existing = supabase.table("app_users").select("id").eq("email", payload.email).limit(1).execute()
     if existing.data:
         raise HTTPException(status_code=409, detail="Email already registered")
@@ -239,7 +231,6 @@ def register(payload: RegisterIn):
         raise HTTPException(status_code=500, detail="Failed to create user")
 
     user = res.data[0]
-    # Créer une copie pour éviter de modifier l'original
     user_response = {k: v for k, v in user.items() if k != "password_hash"}
     token = create_token(user["id"])
     return TokenOut(access_token=token, user=user_response)
@@ -261,7 +252,6 @@ def login(payload: LoginIn):
     if not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # Créer une copie sans le mot de passe
     user_response = {k: v for k, v in user.items() if k != "password_hash"}
     token = create_token(user["id"])
     return TokenOut(access_token=token, user=user_response)
@@ -379,7 +369,8 @@ def _ensure_conversation_owned(conv_id: str, user_id: str) -> Dict[str, Any]:
     return res.data[0]
 
 
-async def _call_groq(messages: List[Dict[str, str]]) -> str:
+def _call_groq_sync(messages: List[Dict[str, str]]) -> str:
+    """Version synchrone pour Gunicorn"""
     if not GROQ_API_KEY:
         raise HTTPException(
             status_code=503,
@@ -396,8 +387,8 @@ async def _call_groq(messages: List[Dict[str, str]]) -> str:
         "temperature": 0.7,
     }
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(GROQ_API_URL, headers=headers, json=body)
+        with httpx.Client(timeout=60.0) as client:
+            r = client.post(GROQ_API_URL, headers=headers, json=body)
         if r.status_code >= 400:
             raise HTTPException(
                 status_code=502,
@@ -450,7 +441,7 @@ def list_messages(conv_id: str, current_user: Dict[str, Any] = Depends(get_curre
 
 
 @app.post("/chat/conversations/{conv_id}/messages")
-async def send_message(
+def send_message(
     conv_id: str,
     payload: ChatMessageIn,
     current_user: Dict[str, Any] = Depends(get_current_user),
@@ -473,8 +464,8 @@ async def send_message(
     # Inverser les messages pour l'ordre chronologique
     messages = [{"role": m["role"], "content": m["content"]} for m in reversed(hist.data or [])]
 
-    # Call Groq
-    assistant_content = await _call_groq(messages)
+    # Call Groq (version synchrone)
+    assistant_content = _call_groq_sync(messages)
 
     # Save assistant message
     saved = (
@@ -490,9 +481,6 @@ async def send_message(
     )
     return saved.data[0] if saved.data else {"role": "assistant", "content": assistant_content}
 
-
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    uvicorn.run("app:app", host=HOST, port=PORT, reload=DEBUG)
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=10000, reload=False)
