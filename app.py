@@ -1,7 +1,15 @@
+"""
+iHub Backend — monolithic FastAPI app.
+
+Run:
+    pip install -r requirements.txt
+    python app.py
+
+Swagger UI: http://localhost:10000/docs
+"""
 
 import os
 import time
-import secrets
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 
@@ -18,29 +26,25 @@ from supabase import create_client, Client
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-SUPABASE_URL = os.environ.get(
-    "SUPABASE_URL",
-    "https://figmeixteescztmmprmi.supabase.co",
-)
-SUPABASE_KEY = os.environ.get(
-    "SUPABASE_KEY",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpZ21laXh0ZWVzY3p0bW1wcm1pIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTM4NjA2MCwiZXhwIjoyMDkwOTYyMDYwfQ.zMIDYvm-Bwv0EUQzME3nZR8ZPoSwTMCaybHRnw_-7Ew",
-)
+SUPABASE_URL = "https://figmeixteescztmmprmi.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpZ21laXh0ZWVzY3p0bW1wcm1pIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTM4NjA2MCwiZXhwIjoyMDkwOTYyMDYwfQ.zMIDYvm-Bwv0EUQzME3nZR8ZPoSwTMCaybHRnw_-7Ew"
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "ihub_super_secret_key_2024")
-# To generate a stronger random key: secrets.token_hex(32)
+SECRET_KEY = "ihub_super_secret_key_2024_change_me_production"
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_API_KEY = "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"
+GROQ_MODEL = "llama-3.1-8b-instant"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", 10000))
-DEBUG = os.environ.get("DEBUG", "False").lower() == "true"
+HOST = "0.0.0.0"
+PORT = 10000
+DEBUG = False
 
 TOKEN_EXPIRY = 86400 * 7  # 7 days, in seconds
 CACHE_TIMEOUT = 300       # 5 minutes
 JWT_ALGORITHM = "HS256"
+
+# CORS
+CORS_ORIGINS = ["*"]
 
 # ---------------------------------------------------------------------------
 # Clients
@@ -190,7 +194,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -220,7 +224,7 @@ def health():
 # ---------------------------------------------------------------------------
 @app.post("/auth/register", response_model=TokenOut, status_code=201)
 def register(payload: RegisterIn):
-    # Correction: Vérification de l'existence de l'email
+    # Vérification de l'existence de l'email
     existing = supabase.table("app_users").select("id").eq("email", payload.email).limit(1).execute()
     if existing.data:
         raise HTTPException(status_code=409, detail="Email already registered")
@@ -235,7 +239,7 @@ def register(payload: RegisterIn):
         raise HTTPException(status_code=500, detail="Failed to create user")
 
     user = res.data[0]
-    # Correction: Créer une copie pour éviter de modifier l'original
+    # Créer une copie pour éviter de modifier l'original
     user_response = {k: v for k, v in user.items() if k != "password_hash"}
     token = create_token(user["id"])
     return TokenOut(access_token=token, user=user_response)
@@ -257,7 +261,7 @@ def login(payload: LoginIn):
     if not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # Correction: Créer une copie sans le mot de passe
+    # Créer une copie sans le mot de passe
     user_response = {k: v for k, v in user.items() if k != "password_hash"}
     token = create_token(user["id"])
     return TokenOut(access_token=token, user=user_response)
@@ -466,7 +470,7 @@ async def send_message(
         .order("created_at", asc=False)
         .execute()
     )
-    # Correction: Inverser les messages pour l'ordre chronologique
+    # Inverser les messages pour l'ordre chronologique
     messages = [{"role": m["role"], "content": m["content"]} for m in reversed(hist.data or [])]
 
     # Call Groq
