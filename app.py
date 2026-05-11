@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timezone
@@ -87,6 +88,32 @@ def to_float(val: Any, default: float = 0.0) -> float:
 
 def normalize_status(status: str, valid: list, default: str) -> str:
     return status if status in valid else default
+
+
+def optional_date(value):
+    return value or None
+
+
+def missing_schema_column(exc: Exception) -> str | None:
+    match = re.search(r"Could not find the '([^']+)' column", str(exc))
+    return match.group(1) if match else None
+
+
+def compatible_insert(table_name: str, data: dict):
+    payload = dict(data)
+    removed_columns = []
+    while True:
+        try:
+            result = supabase.table(table_name).insert(payload).execute()
+            if removed_columns:
+                print(f"⚠️ Colonnes ignorees pour {table_name}: {', '.join(removed_columns)}")
+            return result
+        except Exception as exc:
+            column = missing_schema_column(exc)
+            if not column or column not in payload:
+                raise
+            removed_columns.append(column)
+            payload.pop(column, None)
 
 
 def invalidate_cache(pattern: str = None):
@@ -224,7 +251,7 @@ def roles_required(*allowed):
 
 def add_audit(action: str, entity: str, details: str = None, entity_id: int = None):
     try:
-        supabase.table(TABLES["audit"]).insert({
+        compatible_insert(TABLES["audit"], {
             "action": action,
             "entity_type": entity,
             "entity_id": entity_id,
@@ -232,7 +259,7 @@ def add_audit(action: str, entity: str, details: str = None, entity_id: int = No
             "user_name": g.current_user.get("name") if hasattr(g, 'current_user') else "Systeme",
             "details": details or "",
             "created_at": now_iso()
-        }).execute()
+        })
     except:
         pass
 
@@ -350,7 +377,7 @@ def create_patient():
         "full_name": full_name,
         "phone": data.get("phone", ""),
         "email": data.get("email", ""),
-        "date_of_birth": data.get("date_of_birth"),
+        "date_of_birth": optional_date(data.get("date_of_birth")),
         "gender": data.get("gender", ""),
         "blood_type": data.get("blood_type", ""),
         "address": data.get("address", ""),
@@ -365,7 +392,7 @@ def create_patient():
         "created_at": now_iso(),
         "updated_at": now_iso()
     }
-    result = supabase.table(TABLES["patients"]).insert(patient).execute()
+    result = compatible_insert(TABLES["patients"], patient)
     add_audit("CREATE", "patient", f"Patient: {full_name}", result.data[0]["id"])
     invalidate_cache()
     return jsonify(result.data[0]), 201
@@ -485,7 +512,7 @@ def create_appointment():
         "created_at": now_iso(),
         "updated_at": now_iso()
     }
-    result = supabase.table(TABLES["appointments"]).insert(appointment).execute()
+    result = compatible_insert(TABLES["appointments"], appointment)
     add_audit("CREATE", "appointment", f"RDV #{result.data[0]['id']}", result.data[0]["id"])
     invalidate_cache()
     return jsonify(result.data[0]), 201
@@ -580,8 +607,8 @@ def create_prescription():
         "dosage": data.get("dosage", ""),
         "frequency": data.get("frequency", ""),
         "duration": data.get("duration", ""),
-        "start_date": data.get("start_date"),
-        "end_date": data.get("end_date"),
+        "start_date": optional_date(data.get("start_date")),
+        "end_date": optional_date(data.get("end_date")),
         "instructions": data.get("instructions", ""),
         "status": data.get("status", "active"),
         "doctor_id": g.current_user["id"],
@@ -589,7 +616,7 @@ def create_prescription():
         "created_at": now_iso(),
         "updated_at": now_iso()
     }
-    result = supabase.table(TABLES["prescriptions"]).insert(prescription).execute()
+    result = compatible_insert(TABLES["prescriptions"], prescription)
     add_audit("CREATE", "prescription", f"Prescription #{result.data[0]['id']}", result.data[0]["id"])
     invalidate_cache()
     return jsonify(result.data[0]), 201
@@ -601,6 +628,9 @@ def update_prescription(prescription_id: int):
     data = fast_json()
     allowed = ["medication", "dosage", "frequency", "duration", "start_date", "end_date", "instructions", "status"]
     updates = {k: v for k, v in data.items() if k in allowed and v is not None}
+    for date_field in ("start_date", "end_date"):
+        if date_field in updates:
+            updates[date_field] = optional_date(updates[date_field])
     updates["updated_at"] = now_iso()
 
     result = supabase.table(TABLES["prescriptions"]).update(updates).eq("id", prescription_id).execute()
@@ -664,7 +694,7 @@ def create_lab_test():
         "created_at": now_iso(),
         "updated_at": now_iso()
     }
-    result = supabase.table(TABLES["lab_tests"]).insert(test).execute()
+    result = compatible_insert(TABLES["lab_tests"], test)
     add_audit("CREATE", "lab_test", f"Analyse #{result.data[0]['id']}", result.data[0]["id"])
     invalidate_cache()
     return jsonify(result.data[0]), 201
@@ -790,7 +820,7 @@ def create_care_log():
         "created_at": now_iso(),
         "updated_at": now_iso()
     }
-    result = supabase.table(TABLES["care"]).insert(care).execute()
+    result = compatible_insert(TABLES["care"], care)
     add_audit("CREATE", "care", f"Soin #{result.data[0]['id']}", result.data[0]["id"])
     invalidate_cache()
     return jsonify(result.data[0]), 201
@@ -854,11 +884,11 @@ def create_pharmacy_item():
         "purchase_price": max(0, to_float(data.get("purchase_price"), 0)),
         "selling_price": max(0, to_float(data.get("selling_price"), 0)),
         "threshold": max(0, to_int(data.get("threshold"), 10)),
-        "expiry_date": data.get("expiry_date"),
+        "expiry_date": optional_date(data.get("expiry_date")),
         "created_at": now_iso(),
         "updated_at": now_iso()
     }
-    result = supabase.table(TABLES["pharmacy"]).insert(item).execute()
+    result = compatible_insert(TABLES["pharmacy"], item)
     add_audit("CREATE", "pharmacy", f"Médicament: {data['medication_name']}", result.data[0]["id"])
     invalidate_cache()
     return jsonify(result.data[0]), 201
@@ -879,6 +909,8 @@ def update_pharmacy_item(item_id: int):
     data = fast_json()
     allowed = ["medication_name", "unit", "purchase_price", "selling_price", "threshold", "expiry_date"]
     updates = {k: v for k, v in data.items() if k in allowed and v is not None}
+    if "expiry_date" in updates:
+        updates["expiry_date"] = optional_date(updates["expiry_date"])
     updates["updated_at"] = now_iso()
 
     result = supabase.table(TABLES["pharmacy"]).update(updates).eq("id", item_id).execute()
@@ -982,7 +1014,7 @@ def create_invoice():
         "created_at": now_iso(),
         "updated_at": now_iso()
     }
-    result = supabase.table(TABLES["billing"]).insert(invoice).execute()
+    result = compatible_insert(TABLES["billing"], invoice)
     add_audit("CREATE", "billing", f"Facture #{result.data[0]['id']}: {amount}", result.data[0]["id"])
     invalidate_cache()
     return jsonify(result.data[0]), 201
@@ -1031,7 +1063,7 @@ def create_grouped_invoice():
         "created_at": now_iso(),
         "updated_at": now_iso()
     }
-    result = supabase.table(TABLES["billing"]).insert(invoice).execute()
+    result = compatible_insert(TABLES["billing"], invoice)
 
     if data.get("source") == "pharmacy":
         for item in normalized_items:
@@ -1461,7 +1493,7 @@ def create_pregnancy():
         "updated_at": now_iso()
     }
     
-    result = supabase.table("pregnancies").insert(pregnancy).execute()
+    result = compatible_insert("pregnancies", pregnancy)
     add_audit("CREATE", "pregnancy", f"Grossesse #{result.data[0]['id']}", result.data[0]["id"])
     invalidate_cache()
     return jsonify(result.data[0]), 201
@@ -1555,7 +1587,7 @@ def create_prenatal_consultation():
         "updated_at": now_iso()
     }
     
-    result = supabase.table("prenatal_consultations").insert(consultation).execute()
+    result = compatible_insert("prenatal_consultations", consultation)
     add_audit("CREATE", "prenatal", f"Consultation prénatale #{result.data[0]['id']}", result.data[0]["id"])
     invalidate_cache()
     return jsonify(result.data[0]), 201
@@ -1620,7 +1652,7 @@ def create_delivery():
         "updated_at": now_iso()
     }
     
-    result = supabase.table("deliveries").insert(delivery).execute()
+    result = compatible_insert("deliveries", delivery)
     
     # Créer automatiquement des fiches enfants pour les nouveau-nés
     babies = data.get("babies", [])
@@ -1637,7 +1669,7 @@ def create_delivery():
             "updated_at": now_iso()
         }
         try:
-            supabase.table("children").insert(child_data).execute()
+            compatible_insert("children", child_data)
         except Exception as exc:
             print(f"⚠️ Fiche enfant non créée après accouchement: {exc}")
     
@@ -1695,7 +1727,7 @@ def create_maternity_room():
         "updated_at": now_iso()
     }
     
-    result = supabase.table("maternity_rooms").insert(room).execute()
+    result = compatible_insert("maternity_rooms", room)
     add_audit("CREATE", "maternity_room", f"Lit #{result.data[0]['room_number']}", result.data[0]["id"])
     invalidate_cache()
     return jsonify(result.data[0]), 201
@@ -1794,7 +1826,7 @@ def create_child():
         "updated_at": now_iso()
     }
     
-    result = supabase.table("children").insert(child).execute()
+    result = compatible_insert("children", child)
     add_audit("CREATE", "child", f"Enfant #{result.data[0]['full_name']}", result.data[0]["id"])
     invalidate_cache()
     return jsonify(result.data[0]), 201
@@ -1876,7 +1908,7 @@ def create_vaccination():
         "updated_at": now_iso()
     }
     
-    result = supabase.table("vaccinations").insert(vaccination).execute()
+    result = compatible_insert("vaccinations", vaccination)
     
     # Mettre à jour le statut vaccinal de l'enfant
     supabase.table("children").update({"vaccination_status": "up_to_date", "updated_at": now_iso()}).eq("id", data["child_id"]).execute()
@@ -1968,7 +2000,7 @@ def create_growth_measurement():
         "updated_at": now_iso()
     }
     
-    result = supabase.table("growth_measurements").insert(measurement).execute()
+    result = compatible_insert("growth_measurements", measurement)
     add_audit("CREATE", "growth", f"Mesure croissance pour enfant #{data['child_id']}", result.data[0]["id"])
     invalidate_cache()
     return jsonify(result.data[0]), 201
