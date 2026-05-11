@@ -322,6 +322,7 @@ def auth_me():
 @roles_required(*ROLES["staff"])
 def get_patients():
     search = request.args.get("search", "").strip().lower()
+    context = request.args.get("context", "").strip().lower()
 
     if search:
         result = supabase.table(TABLES["patients"]).select("*")\
@@ -330,7 +331,11 @@ def get_patients():
     else:
         result = supabase.table(TABLES["patients"]).select("*").order("created_at", desc=True).execute()
 
-    return jsonify(filter_patients_for_role(result.data or []))
+    patients = result.data or []
+    if context in ("maternity", "pregnancy", "prenatal", "delivery") and g.current_user.get("role") in ("super_admin", "sage_femme", "gynecologue"):
+        return jsonify([patient for patient in patients if is_female(patient)])
+
+    return jsonify(filter_patients_for_role(patients))
 
 
 @app.route("/api/patients", methods=["POST"])
@@ -1244,6 +1249,17 @@ def seed_admin():
 
 
 # ==================== INITIALISATION DES TABLES ====================
+def execute_schema_sql(sql: str, label: str):
+    if not hasattr(supabase, "sql"):
+        print(f"⚠️ Table {label} absente. Créez-la dans Supabase SQL Editor avec le schéma prévu.")
+        return
+    try:
+        supabase.sql(sql).execute()
+        print(f"✅ Table {label} créée")
+    except Exception as exc:
+        print(f"⚠️ Création table {label} impossible: {exc}")
+
+
 def init_maternity_tables():
     """Crée les tables pour le module maternité si elles n'existent pas"""
     
@@ -1251,9 +1267,8 @@ def init_maternity_tables():
     try:
         supabase.table("pregnancies").select("id").limit(1).execute()
         print("✅ Table pregnancies existe déjà")
-    except Exception as e:
-        if "relation" in str(e) and "does not exist" in str(e):
-            supabase.sql("""
+    except Exception:
+        execute_schema_sql("""
                 CREATE TABLE IF NOT EXISTS pregnancies (
                     id SERIAL PRIMARY KEY,
                     patient_id INTEGER REFERENCES patients(id) ON DELETE CASCADE,
@@ -1268,14 +1283,13 @@ def init_maternity_tables():
                     created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW()
                 )
-            """).execute()
-            print("✅ Table pregnancies créée")
+        """, "pregnancies")
     
     # Table prenatal_consultations
     try:
         supabase.table("prenatal_consultations").select("id").limit(1).execute()
     except:
-        supabase.sql("""
+        execute_schema_sql("""
             CREATE TABLE IF NOT EXISTS prenatal_consultations (
                 id SERIAL PRIMARY KEY,
                 patient_id INTEGER REFERENCES patients(id) ON DELETE CASCADE,
@@ -1291,14 +1305,13 @@ def init_maternity_tables():
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
             )
-        """).execute()
-        print("✅ Table prenatal_consultations créée")
+        """, "prenatal_consultations")
     
     # Table deliveries
     try:
         supabase.table("deliveries").select("id").limit(1).execute()
     except:
-        supabase.sql("""
+        execute_schema_sql("""
             CREATE TABLE IF NOT EXISTS deliveries (
                 id SERIAL PRIMARY KEY,
                 patient_id INTEGER REFERENCES patients(id) ON DELETE CASCADE,
@@ -1314,14 +1327,13 @@ def init_maternity_tables():
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
             )
-        """).execute()
-        print("✅ Table deliveries créée")
+        """, "deliveries")
     
     # Table maternity_rooms
     try:
         supabase.table("maternity_rooms").select("id").limit(1).execute()
     except:
-        supabase.sql("""
+        execute_schema_sql("""
             CREATE TABLE IF NOT EXISTS maternity_rooms (
                 id SERIAL PRIMARY KEY,
                 room_number VARCHAR(20) UNIQUE NOT NULL,
@@ -1334,14 +1346,13 @@ def init_maternity_tables():
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
             )
-        """).execute()
-        print("✅ Table maternity_rooms créée")
+        """, "maternity_rooms")
     
     # Table children
     try:
         supabase.table("children").select("id").limit(1).execute()
     except:
-        supabase.sql("""
+        execute_schema_sql("""
             CREATE TABLE IF NOT EXISTS children (
                 id SERIAL PRIMARY KEY,
                 full_name VARCHAR(100) NOT NULL,
@@ -1357,14 +1368,13 @@ def init_maternity_tables():
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
             )
-        """).execute()
-        print("✅ Table children créée")
+        """, "children")
     
     # Table vaccinations
     try:
         supabase.table("vaccinations").select("id").limit(1).execute()
     except:
-        supabase.sql("""
+        execute_schema_sql("""
             CREATE TABLE IF NOT EXISTS vaccinations (
                 id SERIAL PRIMARY KEY,
                 child_id INTEGER REFERENCES children(id) ON DELETE CASCADE,
@@ -1379,14 +1389,13 @@ def init_maternity_tables():
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
             )
-        """).execute()
-        print("✅ Table vaccinations créée")
+        """, "vaccinations")
     
     # Table growth_measurements
     try:
         supabase.table("growth_measurements").select("id").limit(1).execute()
     except:
-        supabase.sql("""
+        execute_schema_sql("""
             CREATE TABLE IF NOT EXISTS growth_measurements (
                 id SERIAL PRIMARY KEY,
                 child_id INTEGER REFERENCES children(id) ON DELETE CASCADE,
@@ -1401,8 +1410,7 @@ def init_maternity_tables():
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
             )
-        """).execute()
-        print("✅ Table growth_measurements créée")
+        """, "growth_measurements")
 
 
 # ==================== MATERNITÉ ROUTES ====================
@@ -1628,7 +1636,10 @@ def create_delivery():
             "created_at": now_iso(),
             "updated_at": now_iso()
         }
-        supabase.table("children").insert(child_data).execute()
+        try:
+            supabase.table("children").insert(child_data).execute()
+        except Exception as exc:
+            print(f"⚠️ Fiche enfant non créée après accouchement: {exc}")
     
     add_audit("CREATE", "delivery", f"Accouchement #{result.data[0]['id']}", result.data[0]["id"])
     invalidate_cache()
