@@ -19,14 +19,14 @@ from supabase import create_client, Client
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # ==================== CONFIGURATION ====================
-SUPABASE_URL = "https://figmeixteescztmmprmi.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpZ21laXh0ZWVzY3p0bW1wcm1pIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTM4NjA2MCwiZXhwIjoyMDkwOTYyMDYwfQ.zMIDYvm-Bwv0EUQzME3nZR8ZPoSwTMCaybHRnw_-7Ew"
-SECRET_KEY = "ihub_super_secret_key_2024"
-GROQ_API_KEY = "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"
-GROQ_MODEL = "llama-3.1-8b-instant"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://figmeixteescztmmprmi.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")
+SECRET_KEY = os.getenv("SECRET_KEY", "ihub_super_secret_key_2024")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 HOST = "0.0.0.0"
 PORT = 10000
-DEBUG = True
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 TOKEN_EXPIRY = 86400 * 7
 CACHE_TIMEOUT = 300
 
@@ -176,16 +176,56 @@ def active_pregnant_patient_ids() -> set:
         return set()
 
 
+def add_pregnancy_flags(patients: list) -> list:
+    pregnant_ids = active_pregnant_patient_ids()
+    for patient in patients:
+        patient["is_pregnant"] = str(patient.get("id")) in pregnant_ids
+    return patients
+
+
+def linked_patient_ids_for_user() -> set:
+    user_id = g.current_user.get("id") if hasattr(g, "current_user") else None
+    if not user_id:
+        return set()
+    user_id = str(user_id)
+    linked = set()
+    sources = [
+        (TABLES["patients"], "id", ("created_by",)),
+        (TABLES["appointments"], "patient_id", ("created_by", "doctor_id", "practitioner_id", "provider_id", "user_id", "assigned_to")),
+        (TABLES["prescriptions"], "patient_id", ("created_by", "doctor_id", "practitioner_id", "provider_id", "user_id")),
+        (TABLES["lab_tests"], "patient_id", ("created_by", "doctor_id", "requested_by", "technician_id", "user_id")),
+        (TABLES["care"], "patient_id", ("created_by", "nurse_id", "caregiver_id", "user_id")),
+        (TABLES["billing"], "patient_id", ("created_by", "cashier_id", "user_id")),
+    ]
+    for table_name, patient_field, user_fields in sources:
+        for user_field in user_fields:
+            try:
+                rows = supabase.table(table_name).select(f"{patient_field},{user_field}").eq(user_field, user_id).execute().data or []
+                linked.update(str(row.get(patient_field)) for row in rows if row.get(patient_field))
+            except Exception:
+                continue
+    return linked
+
+
 def filter_patients_for_role(patients: list) -> list:
     role = g.current_user.get("role") if hasattr(g, "current_user") else ""
+    patients = add_pregnancy_flags(patients)
+    if role in ("super_admin", "docteur", "infirmier"):
+        return patients
     if role == "pediatre":
         return [p for p in patients if age_years(p) is not None and age_years(p) < 18]
     if role == "gynecologue":
         return [p for p in patients if is_female(p)]
     if role == "sage_femme":
-        pregnant_ids = active_pregnant_patient_ids()
-        return [p for p in patients if is_female(p) and str(p.get("id")) in pregnant_ids]
-    return patients
+        return [p for p in patients if is_female(p) and p.get("is_pregnant")]
+    linked_ids = linked_patient_ids_for_user()
+    if role == "reception" and not linked_ids:
+        return patients
+    return [p for p in patients if str(p.get("id")) in linked_ids]
+
+
+def can_access_patient_record(patient: dict) -> bool:
+    return any(str(row.get("id")) == str(patient.get("id")) for row in filter_patients_for_role([patient]))
 
 
 def filter_appointments_for_role(appointments: list) -> list:
@@ -365,9 +405,12 @@ def get_patients():
     else:
         result = supabase.table(TABLES["patients"]).select("*").order("created_at", desc=True).execute()
 
-    patients = result.data or []
-    if context in ("maternity", "pregnancy", "prenatal", "delivery") and g.current_user.get("role") in ("super_admin", "sage_femme", "gynecologue"):
+    patients = add_pregnancy_flags(result.data or [])
+    role = g.current_user.get("role")
+    if context in ("maternity", "pregnancy", "prenatal", "delivery") and role in ("super_admin", "sage_femme", "gynecologue"):
         return jsonify([patient for patient in patients if is_female(patient)])
+    if context == "pharmacy" and role in ("super_admin", "pharmacie"):
+        return jsonify(patients)
 
     return jsonify(filter_patients_for_role(patients))
 
@@ -396,13 +439,32 @@ def create_patient():
         "priority": data.get("priority", "normal"),
         "doctor_notes": data.get("doctor_notes", ""),
         "room_number": data.get("room_number", ""),
+        "created_by": g.current_user.get("id"),
+        "created_by_name": g.current_user.get("name") or g.current_user.get("email"),
         "created_at": now_iso(),
         "updated_at": now_iso()
     }
     result = compatible_insert(TABLES["patients"], patient)
-    add_audit("CREATE", "patient", f"Patient: {full_name}", result.data[0]["id"])
+    created_patient = result.data[0]
+    if data.get("is_pregnant") and is_female(created_patient):
+        pregnancy_lmp = optional_date(data.get("pregnancy_lmp")) or datetime.now(timezone.utc).date().isoformat()
+        pregnancy = {
+            "patient_id": created_patient["id"],
+            "last_menstrual_period": pregnancy_lmp,
+            "expected_delivery_date": optional_date(data.get("expected_delivery_date")),
+            "risk_level": data.get("risk_level", "normal"),
+            "medical_history": data.get("pregnancy_notes", "Grossesse signalee a la reception, DDR a completer en maternite."),
+            "status": "active",
+            "created_by": g.current_user.get("id"),
+            "created_by_name": g.current_user.get("name") or g.current_user.get("email"),
+            "created_at": now_iso(),
+            "updated_at": now_iso()
+        }
+        compatible_insert("pregnancies", pregnancy)
+        created_patient["is_pregnant"] = True
+    add_audit("CREATE", "patient", f"Patient: {full_name}", created_patient["id"])
     invalidate_cache()
-    return jsonify(result.data[0]), 201
+    return jsonify(created_patient), 201
 
 
 @app.route("/api/patients/<int:patient_id>", methods=["GET"])
@@ -411,13 +473,21 @@ def get_patient(patient_id: int):
     result = supabase.table(TABLES["patients"]).select("*").eq("id", patient_id).execute()
     if not result.data:
         return jsonify({"error": "Patient introuvable"}), 404
-    return jsonify(result.data[0])
+    patient = add_pregnancy_flags(result.data)[0]
+    if not can_access_patient_record(patient):
+        return jsonify({"error": "Acces patient non autorise"}), 403
+    return jsonify(patient)
 
 
 @app.route("/api/patients/<int:patient_id>", methods=["PUT"])
 @roles_required("super_admin", "docteur", "infirmier", "reception", "sage_femme", "gynecologue")
 def update_patient(patient_id: int):
     data = fast_json()
+    existing = supabase.table(TABLES["patients"]).select("*").eq("id", patient_id).execute()
+    if not existing.data:
+        return jsonify({"error": "Patient introuvable"}), 404
+    if not can_access_patient_record(add_pregnancy_flags(existing.data)[0]):
+        return jsonify({"error": "Acces patient non autorise"}), 403
     allowed_fields = ["full_name", "phone", "email", "date_of_birth", "gender", "blood_type",
                       "address", "status", "allergies", "medical_history", "emergency_contact",
                       "insurance", "priority", "doctor_notes", "room_number"]
@@ -2027,13 +2097,13 @@ AI_DISCLAIMER = "Assistant médical uniquement: validation clinique obligatoire 
 
 def groq_chat(system_prompt: str, user_prompt: str) -> str:
     if not GROQ_API_KEY:
-        return "IA non configurée: GROQ_API_KEY manquant côté serveur."
+        return "IA non configuree: ajoute GROQ_API_KEY dans les variables d'environnement Render, puis redemarre le service."
     
     # Vérifier que GROQ_MODEL n'est pas un tuple
     if isinstance(GROQ_MODEL, tuple):
         actual_model = GROQ_MODEL[0] if len(GROQ_MODEL) > 0 else "llama-3.1-8b-instant"
     else:
-        actual_model = GROQ_MODEL
+        actual_model = str(GROQ_MODEL or "llama-3.1-8b-instant").strip()
     
     payload = json.dumps({
         "model": actual_model,
@@ -2054,6 +2124,18 @@ def groq_chat(system_prompt: str, user_prompt: str) -> str:
         with urllib.request.urlopen(req, timeout=25) as response:
             body = json.loads(response.read().decode("utf-8"))
             return body["choices"][0]["message"]["content"]
+    except urllib.error.HTTPError as exc:
+        try:
+            details = exc.read().decode("utf-8", errors="ignore")[:300]
+        except Exception:
+            details = str(exc)
+        if exc.code in (401, 403):
+            return f"IA non autorisee: verifie GROQ_API_KEY sur Render. HTTP {exc.code}. {details}"
+        if exc.code == 404:
+            return f"Modele IA introuvable: verifie GROQ_MODEL='{actual_model}'. HTTP 404. {details}"
+        return f"IA indisponible: Groq a retourne HTTP {exc.code}. {details}"
+    except urllib.error.URLError as exc:
+        return f"IA indisponible: impossible de joindre Groq ({exc.reason})."
     except Exception as exc:
         return f"IA indisponible temporairement: {exc}"
 
