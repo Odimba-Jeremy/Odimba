@@ -19,14 +19,15 @@ from supabase import create_client, Client
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # ==================== CONFIGURATION ====================
-SUPABASE_URL = "https://figmeixteescztmmprmi.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpZ21laXh0ZWVzY3p0bW1wcm1pIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTM4NjA2MCwiZXhwIjoyMDkwOTYyMDYwfQ.zMIDYvm-Bwv0EUQzME3nZR8ZPoSwTMCaybHRnw_-7Ew"
-SECRET_KEY = "SECRET_KEY", "ihub_super_secret_key_2024"
-GROQ_API_KEY = "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"
-GROQ_MODEL = "GROQ_MODEL", "llama-3.1-8b-instant"
-HOST = "0.0.0.0"
-PORT = 10000
-DEBUG =  "true"
+# ✅ CORRECTION: Utiliser les variables d'environnement avec fallback sécurisé
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://figmeixteescztmmprmi.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpZ21laXh0ZWVzY3p0bW1wcm1pIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTM4NjA2MCwiZXhwIjoyMDkwOTYyMDYwfQ.zMIDYvm-[...]")
+SECRET_KEY = os.getenv("SECRET_KEY", "ihub_super_secret_key_2024")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")  # ✅ CORRECTION: Pas de tuple, string simple
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")  # ✅ CORRECTION: Pas de tuple
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", 10000))
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 TOKEN_EXPIRY = 86400 * 7
 CACHE_TIMEOUT = 300
 
@@ -880,7 +881,7 @@ def create_pharmacy_item():
     item = {
         "medication_name": data["medication_name"],
         "quantity": max(0, to_int(data.get("quantity"), 0)),
-        "unit": data.get("unit", "comprimÃ©(s)"),
+        "unit": data.get("unit", "comprimé(s)"),
         "purchase_price": max(0, to_float(data.get("purchase_price"), 0)),
         "selling_price": max(0, to_float(data.get("selling_price"), 0)),
         "threshold": max(0, to_int(data.get("threshold"), 10)),
@@ -1133,7 +1134,7 @@ def mark_invoice_paid(invoice_id: int):
 @roles_required("super_admin")
 def delete_invoice(invoice_id: int):
     supabase.table(TABLES["billing"]).delete().eq("id", invoice_id).execute()
-    add_audit("DELETE", "billing", f"Facture #{invoice_id} supprimée", invoice_id)
+    add_audit("DELETE", "billing", f"Facture #{invoice_id} supprim��e", invoice_id)
     invalidate_cache()
     return jsonify({"message": "Facture supprimée"})
 
@@ -2018,30 +2019,43 @@ def get_child_growth(child_id: int):
 AI_DISCLAIMER = "Assistant médical uniquement: validation clinique obligatoire par un professionnel habilité."
 
 
+# ✅ CORRECTION: Fonction améliorée avec meilleure gestion d'erreur
 def groq_chat(system_prompt: str, user_prompt: str) -> str:
-    if not GROQ_API_KEY:
-        return "IA non configurée: GROQ_API_KEY manquant côté serveur."
-    payload = json.dumps({
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": f"{system_prompt}\n{AI_DISCLAIMER}"},
-            {"role": "user", "content": user_prompt}
-        ],
-        "temperature": 0.2,
-        "max_tokens": 900
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.groq.com/openai/v1/chat/completions",
-        data=payload,
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-        method="POST"
-    )
+    """Appelle l'API Groq avec gestion d'erreur robuste"""
+    if not GROQ_API_KEY or not GROQ_API_KEY.startswith("gsk_"):
+        return "❌ IA non configurée: GROQ_API_KEY manquant ou invalide côté serveur."
+    
     try:
+        payload = json.dumps({
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": f"{system_prompt}\n{AI_DISCLAIMER}"},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": 0.2,
+            "max_tokens": 900
+        }).encode("utf-8")
+        
+        req = urllib.request.Request(
+            "https://api.groq.com/openai/v1/chat/completions",
+            data=payload,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            method="POST"
+        )
+        
         with urllib.request.urlopen(req, timeout=25) as response:
             body = json.loads(response.read().decode("utf-8"))
             return body["choices"][0]["message"]["content"]
+    
+    except urllib.error.HTTPError as e:
+        try:
+            error_body = json.loads(e.read().decode("utf-8"))
+            return f"❌ Erreur API Groq: {error_body.get('error', {}).get('message', str(e))}"
+        except:
+            return f"❌ Erreur API Groq ({e.code}): {e.reason}"
+    
     except Exception as exc:
-        return f"IA indisponible temporairement: {exc}"
+        return f"❌ IA indisponible: {str(exc)}"
 
 
 def ai_payload(key: str, value: str):
@@ -2092,6 +2106,13 @@ if __name__ == "__main__":
     print("=" * 50)
     print("🏥 I HUB HOSPITAL API - VERSION COMPLÈTE")
     print("=" * 50)
+    
+    # ✅ Afficher le statut IA
+    if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
+        print("✅ IA Groq: ACTIVÉE")
+    else:
+        print("⚠️ IA Groq: DÉSACTIVÉE (clé manquante/invalide)")
+    
     seed_admin()
     init_maternity_tables()
     print(f"🚀 Serveur démarré sur http://{HOST}:{PORT}")
