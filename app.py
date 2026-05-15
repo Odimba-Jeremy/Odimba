@@ -5,7 +5,7 @@ import os
 import re
 import secrets
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from functools import wraps
 from typing import Any
 import urllib.error
@@ -19,22 +19,23 @@ from supabase import create_client, Client
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # ==================== CONFIGURATION ====================
-# ✅ CORRECTION: Utiliser les variables d'environnement avec fallback sécurisé
 SUPABASE_URL = "https://figmeixteescztmmprmi.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpZ21laXh0ZWVzY3p0bW1wcm1pIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTM4NjA2MCwiZXhwIjoyMDkwOTYyMDYwfQ.zMIDYvm-Bwv0EUQzME3nZR8ZPoSwTMCaybHRnw_-7Ew"
-SECRET_KEY = "SECRET_KEY", "ihub_super_secret_key_2024"
+SECRET_KEY = "ihub_super_secret_key_2024"
 GROQ_API_KEY = "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"
 GROQ_MODEL = "llama-3.1-8b-instant"
 HOST = "0.0.0.0"
 PORT = 10000
-DEBUG =  "true"
+DEBUG = True
 TOKEN_EXPIRY = 86400 * 7
 CACHE_TIMEOUT = 300
+
 # ==================== INITIALISATION ====================
 app = Flask(__name__)
 app.config["SECRET_KEY"] = SECRET_KEY
 app.config["CACHE_TYPE"] = "SimpleCache"
 app.config["CACHE_DEFAULT_TIMEOUT"] = CACHE_TIMEOUT
+app.config["JSON_AS_ASCII"] = False
 
 cache = Cache(app)
 CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
@@ -144,7 +145,13 @@ def parse_date(value):
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+        if isinstance(value, str):
+            if 'T' in value:
+                return datetime.fromisoformat(value.replace('Z', '+00:00')).date()
+            return datetime.fromisoformat(value).date()
+        elif hasattr(value, 'date'):
+            return value.date()
+        return value
     except Exception:
         return None
 
@@ -1133,7 +1140,7 @@ def mark_invoice_paid(invoice_id: int):
 @roles_required("super_admin")
 def delete_invoice(invoice_id: int):
     supabase.table(TABLES["billing"]).delete().eq("id", invoice_id).execute()
-    add_audit("DELETE", "billing", f"Facture #{invoice_id} supprim��e", invoice_id)
+    add_audit("DELETE", "billing", f"Facture #{invoice_id} supprimée", invoice_id)
     invalidate_cache()
     return jsonify({"message": "Facture supprimée"})
 
@@ -2018,43 +2025,37 @@ def get_child_growth(child_id: int):
 AI_DISCLAIMER = "Assistant médical uniquement: validation clinique obligatoire par un professionnel habilité."
 
 
-# ✅ CORRECTION: Fonction améliorée avec meilleure gestion d'erreur
 def groq_chat(system_prompt: str, user_prompt: str) -> str:
-    """Appelle l'API Groq avec gestion d'erreur robuste"""
-    if not GROQ_API_KEY or not GROQ_API_KEY.startswith("gsk_"):
-        return "❌ IA non configurée: GROQ_API_KEY manquant ou invalide côté serveur."
+    if not GROQ_API_KEY:
+        return "IA non configurée: GROQ_API_KEY manquant côté serveur."
     
+    # Vérifier que GROQ_MODEL n'est pas un tuple
+    if isinstance(GROQ_MODEL, tuple):
+        actual_model = GROQ_MODEL[0] if len(GROQ_MODEL) > 0 else "llama-3.1-8b-instant"
+    else:
+        actual_model = GROQ_MODEL
+    
+    payload = json.dumps({
+        "model": actual_model,
+        "messages": [
+            {"role": "system", "content": f"{system_prompt}\n{AI_DISCLAIMER}"},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.2,
+        "max_tokens": 900
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=payload,
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        method="POST"
+    )
     try:
-        payload = json.dumps({
-            "model": GROQ_MODEL,
-            "messages": [
-                {"role": "system", "content": f"{system_prompt}\n{AI_DISCLAIMER}"},
-                {"role": "user", "content": user_prompt}
-            ],
-            "temperature": 0.2,
-            "max_tokens": 900
-        }).encode("utf-8")
-        
-        req = urllib.request.Request(
-            "https://api.groq.com/openai/v1/chat/completions",
-            data=payload,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            method="POST"
-        )
-        
         with urllib.request.urlopen(req, timeout=25) as response:
             body = json.loads(response.read().decode("utf-8"))
             return body["choices"][0]["message"]["content"]
-    
-    except urllib.error.HTTPError as e:
-        try:
-            error_body = json.loads(e.read().decode("utf-8"))
-            return f"❌ Erreur API Groq: {error_body.get('error', {}).get('message', str(e))}"
-        except:
-            return f"❌ Erreur API Groq ({e.code}): {e.reason}"
-    
     except Exception as exc:
-        return f"❌ IA indisponible: {str(exc)}"
+        return f"IA indisponible temporairement: {exc}"
 
 
 def ai_payload(key: str, value: str):
@@ -2105,13 +2106,6 @@ if __name__ == "__main__":
     print("=" * 50)
     print("🏥 I HUB HOSPITAL API - VERSION COMPLÈTE")
     print("=" * 50)
-    
-    # ✅ Afficher le statut IA
-    if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
-        print("✅ IA Groq: ACTIVÉE")
-    else:
-        print("⚠️ IA Groq: DÉSACTIVÉE (clé manquante/invalide)")
-    
     seed_admin()
     init_maternity_tables()
     print(f"🚀 Serveur démarré sur http://{HOST}:{PORT}")
