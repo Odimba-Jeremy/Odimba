@@ -21,12 +21,12 @@ from werkzeug.security import generate_password_hash, check_password_hash
 # ==================== CONFIGURATION ====================
 SUPABASE_URL = "https://figmeixteescztmmprmi.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpZ21laXh0ZWVzY3p0bW1wcm1pIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTM4NjA2MCwiZXhwIjoyMDkwOTYyMDYwfQ.zMIDYvm-Bwv0EUQzME3nZR8ZPoSwTMCaybHRnw_-7Ew"
-SECRET_KEY = "SECRET_KEY", "ihub_super_secret_key_2024"
+SECRET_KEY = "ihub_super_secret_key_2024"
 GROQ_API_KEY = "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"
 GROQ_MODEL = "llama-3.1-8b-instant"
 HOST = "0.0.0.0"
 PORT = 10000
-DEBUG =  "true"
+DEBUG = True
 TOKEN_EXPIRY = 86400 * 7
 CACHE_TIMEOUT = 300
 # ==================== INITIALISATION ====================
@@ -2141,6 +2141,25 @@ def groq_chat(system_prompt: str, user_prompt: str) -> str:
 
 def ai_payload(key: str, value: str):
     return jsonify({key: value, "disclaimer": AI_DISCLAIMER})
+
+
+@app.route("/api/ai/health", methods=["GET"])
+@roles_required(*ROLES["staff"])
+def ai_health():
+    configured = bool(GROQ_API_KEY and str(GROQ_API_KEY).startswith("gsk_"))
+    if not configured:
+        return jsonify({
+            "ok": False,
+            "model": GROQ_MODEL,
+            "message": "Cle Groq absente ou invalide dans app.py"
+        }), 500
+    answer = groq_chat("Reponds uniquement par OK.", "Test de connexion IA.")
+    ok = answer.strip().lower().startswith("ok")
+    return jsonify({
+        "ok": ok,
+        "model": str(GROQ_MODEL),
+        "message": answer
+    }), 200 if ok else 502
 
 
 @app.route("/api/ai/patient-summary", methods=["POST"])
