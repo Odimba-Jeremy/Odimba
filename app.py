@@ -2095,8 +2095,9 @@ AI_DISCLAIMER = "Assistant médical uniquement: validation clinique obligatoire 
 
 
 def groq_chat(system_prompt: str, user_prompt: str) -> str:
-    if not GROQ_API_KEY:
-        return "IA non configuree: ajoute GROQ_API_KEY dans les variables d'environnement Render, puis redemarre le service."
+    api_key = str(GROQ_API_KEY or "").strip()
+    if not api_key:
+        return "IA non configuree: ajoute une cle Groq valide dans app.py, puis redeploie le service."
     
     # Vérifier que GROQ_MODEL n'est pas un tuple
     if isinstance(GROQ_MODEL, tuple):
@@ -2116,7 +2117,7 @@ def groq_chat(system_prompt: str, user_prompt: str) -> str:
     req = urllib.request.Request(
         "https://api.groq.com/openai/v1/chat/completions",
         data=payload,
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST"
     )
     try:
@@ -2129,7 +2130,7 @@ def groq_chat(system_prompt: str, user_prompt: str) -> str:
         except Exception:
             details = str(exc)
         if exc.code in (401, 403):
-            return f"IA non autorisee: verifie GROQ_API_KEY sur Render. HTTP {exc.code}. {details}"
+            return f"IA non autorisee: la cle Groq dans app.py est invalide, expiree, supprimee ou sans acces API. HTTP {exc.code}. {details}"
         if exc.code == 404:
             return f"Modele IA introuvable: verifie GROQ_MODEL='{actual_model}'. HTTP 404. {details}"
         return f"IA indisponible: Groq a retourne HTTP {exc.code}. {details}"
